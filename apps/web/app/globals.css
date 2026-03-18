@@ -130,11 +130,54 @@ select:focus {
   background: var(--code-bg);
   border: 1px solid var(--code-border);
   border-radius: var(--radius-lg);
-  font-family: ui-monospace, "SF Mono", "Menlo", "Monaco", "Consolas", monospace;
-  font-size: 13px;
-  line-height: 1.6;
+  font-family: "Menlo", "Monaco", "Courier New", monospace;
+  font-size: 12.5px;
+  font-weight: 400;
+  line-height: 1.65;
+  letter-spacing: 0;
   color: var(--code-text);
   overflow: auto;
+}
+
+.lpft-code-token-comment {
+  color: rgba(106, 153, 85, 0.92);
+}
+
+.lpft-code-token-string {
+  color: rgba(206, 145, 120, 0.96);
+}
+
+.lpft-code-token-keyword {
+  color: rgba(197, 134, 192, 0.98);
+}
+
+.lpft-code-token-number {
+  color: rgba(181, 206, 168, 0.98);
+}
+
+.lpft-code-token-function {
+  color: rgba(220, 220, 170, 0.98);
+}
+
+.lpft-code-token-decorator {
+  color: rgba(86, 156, 214, 0.98);
+}
+
+.lpft-code-label {
+  font-family: var(--font-code), ui-monospace, "SF Mono", "IBM Plex Mono", "Fira Code", monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.lpft-code-badge {
+  font-family: var(--font-code), ui-monospace, "SF Mono", "IBM Plex Mono", "Fira Code", monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  color: var(--text-primary);
 }
 
 .lpft-reasoning-bar {

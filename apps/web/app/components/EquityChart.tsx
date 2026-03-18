@@ -16,6 +16,7 @@ interface EquityChartProps {
   height?: number;
   loading?: boolean;
   colorMode?: "positive" | "negative" | "neutral";
+  visibleRange?: { from: number; to: number } | null;
 }
 
 export function EquityChart({
@@ -23,6 +24,7 @@ export function EquityChart({
   height = 320,
   loading,
   colorMode = "neutral",
+  visibleRange = null,
 }: EquityChartProps) {
   const chartRef = useRef<HTMLDivElement>(null);
   const chartInstance = useRef<IChartApi | null>(null);
@@ -64,6 +66,14 @@ export function EquityChart({
       lineWidth: 1,
     });
     area.setData(data);
+    if (visibleRange) {
+      chart.timeScale().setVisibleRange({
+        from: visibleRange.from as UTCTimestamp as Time,
+        to: visibleRange.to as UTCTimestamp as Time,
+      });
+    } else {
+      chart.timeScale().fitContent();
+    }
     chartInstance.current = chart;
     seriesRef.current = area;
     const handleResize = () => chart.applyOptions({ width: chartRef.current?.offsetWidth ?? 0 });
@@ -80,7 +90,17 @@ export function EquityChart({
     if (seriesRef.current) {
       seriesRef.current.setData(data);
     }
-  }, [data]);
+    if (chartInstance.current) {
+      if (visibleRange) {
+        chartInstance.current.timeScale().setVisibleRange({
+          from: visibleRange.from as UTCTimestamp as Time,
+          to: visibleRange.to as UTCTimestamp as Time,
+        });
+      } else {
+        chartInstance.current.timeScale().fitContent();
+      }
+    }
+  }, [data, visibleRange]);
 
   useEffect(() => {
     if (seriesRef.current) {

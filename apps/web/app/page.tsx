@@ -32,6 +32,85 @@ function currentReasoningPhrase(reasoning: string): string {
   return t.slice(lastEnd + 1).trim() || t;
 }
 
+type CodeTokenKind =
+  | "plain"
+  | "comment"
+  | "string"
+  | "keyword"
+  | "number"
+  | "function"
+  | "decorator";
+
+function tokenizePythonLine(line: string): { text: string; kind: CodeTokenKind }[] {
+  const tokens: { text: string; kind: CodeTokenKind }[] = [];
+  const pattern =
+    /(#.*$)|(@[A-Za-z_][A-Za-z0-9_]*)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\b(def|return|if|elif|else|for|while|in|import|from|as|True|False|None|and|or|not|class|try|except|with|yield|break|continue|pass)\b|\b(\d+(?:\.\d+)?)\b/g;
+
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(line)) !== null) {
+    const [fullMatch, comment, decorator, stringToken, keywordToken, numberToken] = match;
+    if (match.index > lastIndex) {
+      tokens.push({ text: line.slice(lastIndex, match.index), kind: "plain" });
+    }
+    let kind: CodeTokenKind = "plain";
+    if (comment) kind = "comment";
+    else if (decorator) kind = "decorator";
+    else if (stringToken) kind = "string";
+    else if (keywordToken) kind = "keyword";
+    else if (numberToken) kind = "number";
+    tokens.push({ text: fullMatch, kind });
+    lastIndex = match.index + fullMatch.length;
+  }
+
+  if (lastIndex < line.length) {
+    tokens.push({ text: line.slice(lastIndex), kind: "plain" });
+  }
+
+  const out: { text: string; kind: CodeTokenKind }[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const current = tokens[i];
+    out.push(current);
+    if (
+      current.kind === "keyword" &&
+      (current.text === "def" || current.text === "class") &&
+      i + 2 < tokens.length &&
+      tokens[i + 1].kind === "plain"
+    ) {
+      const fnMatch = tokens[i + 2].text.match(/^[A-Za-z_][A-Za-z0-9_]*/);
+      if (fnMatch) {
+        const name = fnMatch[0];
+        out.push({ text: tokens[i + 1].text, kind: "plain" });
+        out.push({ text: name, kind: "function" });
+        const rest = tokens[i + 2].text.slice(name.length);
+        if (rest) out.push({ text: rest, kind: tokens[i + 2].kind });
+        i += 2;
+      }
+    }
+  }
+  return out;
+}
+
+function renderPythonCode(code: string) {
+  const lines = code.split("\n");
+  return lines.map((line, lineIndex) => {
+    const tokens = tokenizePythonLine(line);
+    return (
+      <span key={`line-${lineIndex}`}>
+        {tokens.map((token, tokenIndex) => (
+          <span
+            key={`token-${lineIndex}-${tokenIndex}`}
+            className={token.kind === "plain" ? undefined : `lpft-code-token-${token.kind}`}
+          >
+            {token.text}
+          </span>
+        ))}
+        {lineIndex < lines.length - 1 ? "\n" : null}
+      </span>
+    );
+  });
+}
+
 function parseTradesCsv(csvText: string): {
   entry_time: number;
   exit_time: number;
@@ -224,7 +303,16 @@ function TradesTable({
                 <td className="px-3 py-2 text-right text-[var(--text-primary)] font-medium">
                   {t.pnl.toFixed(2)}
                 </td>
-                <td className="px-3 py-2 text-right text-[var(--text-primary)] font-medium">
+                <td
+                  className={[
+                    "px-3 py-2 text-right font-medium",
+                    t.pnl_pct > 0
+                      ? "text-[rgb(21,128,61)]"
+                      : t.pnl_pct < 0
+                        ? "text-[rgb(185,28,28)]"
+                        : "text-[var(--text-primary)]",
+                  ].join(" ")}
+                >
                   {(t.pnl_pct * 100).toFixed(2)}%
                 </td>
               </tr>
@@ -284,6 +372,8 @@ function ChatColumn() {
   const [savingCode, setSavingCode] = useState<string | null>(null);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+  const autoScrollRef = useRef(true);
 
   const triggerBacktest = useCallback((runId: number) => {
     window.dispatchEvent(new CustomEvent("lpft-backtest-run", { detail: { runId } }));
@@ -291,6 +381,7 @@ function ChatColumn() {
 
   const handleGenerate = async () => {
     if (!input.trim() && attachments.length === 0) return;
+    autoScrollRef.current = true;
     setError(null);
     setLoading(true);
     const userPrompt = [
@@ -452,8 +543,16 @@ function ChatColumn() {
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (!autoScrollRef.current) return;
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages]);
+
+  const handleChatScroll = useCallback(() => {
+    const el = chatScrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    autoScrollRef.current = distanceFromBottom < 80;
+  }, []);
 
   useEffect(() => {
     const handler = (e: CustomEvent<{ status: string }>) => {
@@ -480,7 +579,11 @@ function ChatColumn() {
 
   return (
     <>
-      <div className="flex-1 overflow-y-auto scrollbar-thin">
+      <div
+        ref={chatScrollRef}
+        onScroll={handleChatScroll}
+        className="flex-1 overflow-y-auto scrollbar-thin"
+      >
         <div className="mx-auto max-w-2xl px-4 py-6 space-y-8">
           {messages.length === 0 && (
             <div className="flex flex-col items-center justify-center min-h-[240px] text-center px-4">
@@ -504,7 +607,7 @@ function ChatColumn() {
               <div key={i} className="space-y-4">
                 {(msg.reasoning || msg.streaming) && (
                   <div className="rounded-[20px] border border-[var(--border-subtle)] bg-[rgba(255,255,255,0.025)] px-4 py-3.5">
-                    <p className="text-[10px] uppercase tracking-wider text-[var(--text-tertiary)] mb-1.5">
+                    <p className="text-[11px] uppercase tracking-wider text-[var(--text-tertiary)] mb-1.5">
                       Reasoning
                     </p>
                     <p className="text-[13px] text-[var(--text-secondary)] leading-relaxed whitespace-pre-wrap">
@@ -516,7 +619,9 @@ function ChatColumn() {
                 {(msg.code || msg.streaming) && (
                   <div className="lpft-panel overflow-hidden rounded-[20px]">
                     <div className="px-3.5 py-2 border-b border-[var(--border-subtle)] flex items-center justify-between bg-[var(--code-bg)]/80">
-                      <span className="lpft-panel-header">Codice</span>
+                      <span className="text-[11px] text-[var(--text-tertiary)] tracking-wider uppercase">
+                        Codice
+                      </span>
                       <div className="flex items-center gap-2">
                         <button
                           type="button"
@@ -534,13 +639,11 @@ function ChatColumn() {
                         >
                           Fullscreen
                         </button>
-                        <span className="text-[10px] text-[var(--text-secondary)] font-mono tracking-wider">PY</span>
+                        <span className="lpft-code-badge">PY</span>
                       </div>
                     </div>
                     <pre className="lpft-code-block p-4 text-[12px] whitespace-pre-wrap overflow-auto max-h-[360px] scrollbar-thin">
-                      {msg.streaming && !msg.code
-                        ? "Generazione in corso…"
-                        : msg.code}
+                      {msg.streaming && !msg.code ? "Generazione in corso…" : renderPythonCode(msg.code)}
                     </pre>
                     {msg.code && (
                       <div className="px-3.5 py-2 border-t border-[var(--border-subtle)] bg-[rgba(255,255,255,0.02)]">
@@ -616,7 +719,7 @@ function ChatColumn() {
             }}
             placeholder="Descrivi la strategia…"
             rows={4}
-            className="flex-1 min-h-[110px] max-h-[220px] px-4 py-3 rounded-[22px] bg-[var(--bg-tertiary)] border border-[var(--border-subtle)] text-[13px] text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] resize-none focus:outline-none focus:ring-0 focus:border-[var(--border-subtle)]"
+            className="flex-1 min-h-[112px] max-h-[226px] px-5 py-4 rounded-[22px] bg-[var(--bg-tertiary)] border border-[var(--border-subtle)] text-[13px] leading-[1.7] tracking-[-0.01em] text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] resize-none focus:outline-none focus:ring-0 focus:border-[var(--border-subtle)]"
             disabled={loading}
           />
           <button
@@ -646,7 +749,7 @@ function ChatColumn() {
         <div className="fixed inset-0 z-50 bg-[#050507]">
           <div className="absolute inset-6 lpft-card">
             <div className="shrink-0 px-4 py-3 border-b border-[var(--border-subtle)] flex items-center justify-between">
-              <p className="text-[12px] text-[var(--text-secondary)]">Codice</p>
+              <p className="text-[11px] text-[var(--text-tertiary)] tracking-wider uppercase">Codice</p>
               <button
                 type="button"
                 onClick={() => setFullscreenCode(null)}
@@ -657,7 +760,7 @@ function ChatColumn() {
             </div>
             <div className="flex-1 p-4 overflow-hidden">
               <pre className="lpft-code-block h-full p-4 text-[12px] whitespace-pre-wrap overflow-auto scrollbar-thin">
-                {fullscreenCode}
+                {renderPythonCode(fullscreenCode)}
               </pre>
             </div>
           </div>
@@ -816,6 +919,13 @@ function BacktestColumn() {
 
   const baseEquity = equityData.length > 0 ? equityData : flatEquity;
   const chartData = dataForRange(baseEquity);
+  const chartVisibleRange =
+    baseEquity.length > 0
+      ? {
+          from: cutoffForRange(Number(baseEquity[baseEquity.length - 1].time)),
+          to: Number(baseEquity[baseEquity.length - 1].time),
+        }
+      : null;
   const chartKey = `${runId ?? 0}:${range}:${chartData.length > 0 ? Number(chartData[0].time) : 0}`;
   const filteredTrades = (() => {
     if (!trades.length) return [];
@@ -878,16 +988,6 @@ function BacktestColumn() {
       : (rangeMetrics.total_return ?? 0) > 0
         ? "positive"
         : "negative";
-  const pendingTooLong =
-    runId != null &&
-    run != null &&
-    (run.status === "pending" || run.status === "running") &&
-    (() => {
-      const t = Date.parse(run.created_at || "");
-      if (!Number.isFinite(t)) return false;
-      return Date.now() - t > 20_000;
-    })();
-
   const parameterRows = buildParameterRows(strategySpec, runParams, run);
 
   return (
@@ -916,12 +1016,7 @@ function BacktestColumn() {
               <button
                 key={id}
                 type="button"
-                onClick={() => {
-                  setTab(id);
-                  if (id === "metrics" || id === "parameters" || id === "trade") {
-                    setFullscreenTab(id);
-                  }
-                }}
+                onClick={() => setTab(id)}
                 className={[
                   "h-7 px-2.5 rounded-lg text-[11px] border",
                   tab === id
@@ -983,6 +1078,7 @@ function BacktestColumn() {
                 height={220}
                 loading={runId != null ? (run?.status !== "completed" || loadingArtifacts) : false}
                 colorMode={chartColorMode}
+                visibleRange={chartVisibleRange}
                 key={chartKey}
               />
             </div>
@@ -1030,7 +1126,17 @@ function BacktestColumn() {
 
         {tab === "metrics" && (
           <div className="lpft-panel p-4">
-            <p className="lpft-panel-header mb-3">Metriche</p>
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <p className="lpft-panel-header">Metriche</p>
+              <button
+                type="button"
+                onClick={() => setFullscreenTab("metrics")}
+                className="h-7 px-2.5 rounded-lg text-[11px] border border-[var(--border-subtle)] text-[var(--text-secondary)] bg-transparent hover:text-[var(--text-primary)]"
+                title="Fullscreen"
+              >
+                Fullscreen
+              </button>
+            </div>
             <MetricsTable
               rows={[
                 ["Return", `${((rangeMetrics.total_return ?? 0) * 100).toFixed(2)}%`],
@@ -1047,14 +1153,34 @@ function BacktestColumn() {
 
         {tab === "parameters" && (
           <div className="lpft-panel p-4">
-            <p className="lpft-panel-header mb-3">Parameters</p>
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <p className="lpft-panel-header">Parameters</p>
+              <button
+                type="button"
+                onClick={() => setFullscreenTab("parameters")}
+                className="h-7 px-2.5 rounded-lg text-[11px] border border-[var(--border-subtle)] text-[var(--text-secondary)] bg-transparent hover:text-[var(--text-primary)]"
+                title="Fullscreen"
+              >
+                Fullscreen
+              </button>
+            </div>
             <ParameterTable rows={parameterRows} />
           </div>
         )}
 
         {tab === "trade" && (
           <div className="lpft-panel p-4">
-            <p className="lpft-panel-header mb-3">Trade</p>
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <p className="lpft-panel-header">Trade</p>
+              <button
+                type="button"
+                onClick={() => setFullscreenTab("trade")}
+                className="h-7 px-2.5 rounded-lg text-[11px] border border-[var(--border-subtle)] text-[var(--text-secondary)] bg-transparent hover:text-[var(--text-primary)]"
+                title="Fullscreen"
+              >
+                Fullscreen
+              </button>
+            </div>
             <TradesTable trades={filteredTrades} />
           </div>
         )}
@@ -1070,14 +1196,6 @@ function BacktestColumn() {
             In esecuzione…
           </div>
         )}
-        {pendingTooLong && (
-          <div className="rounded-lg border border-[var(--border-strong)] bg-[var(--surface-overlay)] px-3.5 py-2.5 text-[12px] text-[var(--text-secondary)]">
-            Il run è in coda ma non sta avanzando. Se stai usando la modalità con worker, assicurati che{" "}
-            <span className="text-[var(--text-primary)]">Redis</span> e il{" "}
-            <span className="text-[var(--text-primary)]">worker</span> siano avviati.
-          </div>
-        )}
-
         {artifacts.length > 0 && (
           <div className="lpft-panel p-3.5">
             <p className="lpft-panel-header mb-2">File</p>
@@ -1113,7 +1231,13 @@ function BacktestColumn() {
             </div>
             <div className="flex-1 p-4">
               <div className="lpft-panel h-full overflow-hidden">
-                <EquityChart data={chartData} height={640} loading={false} colorMode={chartColorMode} />
+                <EquityChart
+                  data={chartData}
+                  height={640}
+                  loading={false}
+                  colorMode={chartColorMode}
+                  visibleRange={chartVisibleRange}
+                />
               </div>
             </div>
           </div>
