@@ -31,14 +31,14 @@ export function EquityChart({
   const palette =
     colorMode === "positive"
       ? {
-          lineColor: "rgba(22, 163, 74, 0.92)",
-          topColor: "rgba(22, 163, 74, 0.16)",
+          lineColor: "rgba(21, 128, 61, 0.88)",
+          topColor: "rgba(21, 128, 61, 0.12)",
           bottomColor: "rgba(0,0,0,0)",
         }
       : colorMode === "negative"
         ? {
-            lineColor: "rgba(220, 38, 38, 0.92)",
-            topColor: "rgba(220, 38, 38, 0.16)",
+            lineColor: "rgba(185, 28, 28, 0.88)",
+            topColor: "rgba(185, 28, 28, 0.12)",
             bottomColor: "rgba(0,0,0,0)",
           }
         : {

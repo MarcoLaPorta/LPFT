@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import types
+from typing import Any
+
 import pandas as pd
 
 ProgramSecurityError = type("ProgramSecurityError", (Exception,), {})
@@ -19,7 +20,10 @@ def _safe_import(name: str, globals=None, locals=None, fromlist=(), level=0):
 
 
 def _validate_python(code: str) -> None:
-    if "import" in code and "os" in code or "subprocess" in code or "open" in code and "path" in code.lower():
+    lowered = code.lower()
+    if "subprocess" in lowered or "socket" in lowered or "requests" in lowered:
+        raise ProgramSecurityError("Disallowed operations")
+    if "import os" in lowered or "import sys" in lowered:
         raise ProgramSecurityError("Disallowed operations")
 
 
@@ -78,7 +82,7 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
 
 def run_generate_signals(code: str, ohlcv: pd.DataFrame) -> pd.Series:
     _validate_python(code)
-    locs = {
+    locs: dict[str, Any] = {
         "pd": pd,
         "pandas": pd,
         "ohlcv": ohlcv,
@@ -90,7 +94,15 @@ def run_generate_signals(code: str, ohlcv: pd.DataFrame) -> pd.Series:
         "macd_hist": macd_hist,
         "bollinger_bands": bollinger_bands,
         "atr": atr,
-        "__builtins__": {"__import__": _safe_import, "min": min, "max": max, "abs": abs, "len": len},
+        "__builtins__": {
+            "__import__": _safe_import,
+            "min": min,
+            "max": max,
+            "abs": abs,
+            "len": len,
+            "sum": sum,
+            "range": range,
+        },
     }
     exec(code, locs)
     gen = locs.get("generate_signals")
@@ -101,11 +113,10 @@ def run_generate_signals(code: str, ohlcv: pd.DataFrame) -> pd.Series:
         return out
     if isinstance(out, (tuple, list)) and len(out) >= 2:
         entries, exits = out[0], out[1]
-        sig = pd.Series(0, index=ohlcv.index)
-        sig = sig.astype(float)
+        sig = pd.Series(0, index=ohlcv.index).astype(float)
         if hasattr(entries, "values"):
-            sig.loc[entries.fillna(False)] = 1.0
+            sig.loc[pd.Series(entries).reindex(ohlcv.index).fillna(False)] = 1.0
         if hasattr(exits, "values"):
-            sig.loc[exits.fillna(False)] = -1.0
+            sig.loc[pd.Series(exits).reindex(ohlcv.index).fillna(False)] = -1.0
         return sig
     raise ProgramSecurityError("generate_signals must return Series or (entries, exits)")

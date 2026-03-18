@@ -11,6 +11,10 @@ import { EquityChart, parseEquityCsv } from "./components/EquityChart";
 import type { LineData } from "lightweight-charts";
 
 const POLL_INTERVAL_MS = 2000;
+const DEFAULT_SYMBOL = "AAPL";
+const DEFAULT_TIMEFRAME = "1d";
+const DEFAULT_VIEW_RANGE = "1y";
+const BACKTEST_DATA_PERIOD = "5y";
 
 /** Estrae la frase corrente dal ragionamento (ultima frase o testo in corso). */
 function currentReasoningPhrase(reasoning: string): string {
@@ -92,15 +96,47 @@ function MetricsTable({ rows }: { rows: [string, string][] }) {
   );
 }
 
+function formatParameterLabel(label: string): string {
+  return label
+    .split(" · ")
+    .map((part) => {
+      if (/^\d+$/.test(part)) return `[${part}]`;
+      return part.replace(/_/g, " ");
+    })
+    .join(" / ");
+}
+
+function ParameterTable({ rows }: { rows: [string, string][] }) {
+  return (
+    <div className="overflow-hidden rounded-lg border border-[var(--border-subtle)]">
+      <table className="w-full table-fixed text-[12px]">
+        <tbody>
+          {rows.map(([k, v]) => (
+            <tr key={k} className="border-b border-[var(--border-subtle)] last:border-b-0 align-top">
+              <td className="w-[42%] px-3 py-2 text-[var(--text-tertiary)] break-words">
+                {formatParameterLabel(k)}
+              </td>
+              <td className="px-3 py-2 text-[var(--text-primary)] font-medium whitespace-pre-wrap break-words">
+                {v}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function buildParameterRows(
   strategySpec: StrategySpec | null,
-  runParams: { symbol?: string; period?: string; timeframe?: string } | null,
+  runParams: { symbol?: string; period?: string; timeframe?: string; viewRange?: string } | null,
   run: RunOut | null
 ): [string, string][] {
   const source = {
-    symbol: runParams?.symbol ?? run?.symbol ?? "AAPL",
-    period: runParams?.period ?? run?.period ?? "1y",
-    timeframe: runParams?.timeframe ?? run?.timeframe ?? "1d",
+    symbol: runParams?.symbol ?? run?.symbol ?? DEFAULT_SYMBOL,
+    backtest_period: runParams?.period ?? run?.period ?? BACKTEST_DATA_PERIOD,
+    view_range: runParams?.viewRange ?? DEFAULT_VIEW_RANGE,
+    timeframe: runParams?.timeframe ?? run?.timeframe ?? DEFAULT_TIMEFRAME,
     strategy_spec: strategySpec,
   };
 
@@ -235,7 +271,7 @@ type ChatMessage =
       streaming?: boolean;
       backtestStatus?: "idle" | "running" | "completed";
       spec?: StrategySpec | null;
-      params?: { symbol?: string; period?: string; timeframe?: string } | null;
+      params?: { symbol?: string; period?: string; timeframe?: string; viewRange?: string } | null;
     };
 
 function ChatColumn() {
@@ -302,9 +338,9 @@ function ChatColumn() {
           api.generate
             .andBacktest({
               strategy_spec: spec as StrategySpec,
-              period: "1y",
-              timeframe: "1d",
-              symbol: "AAPL",
+              period: BACKTEST_DATA_PERIOD,
+              timeframe: DEFAULT_TIMEFRAME,
+              symbol: DEFAULT_SYMBOL,
             })
             .then((backtestRes) => {
               setMessages((prev) => {
@@ -317,7 +353,12 @@ function ChatColumn() {
                     code: backtestRes.program_code,
                     backtestStatus: "running",
                     spec: spec as StrategySpec,
-                    params: { symbol: "AAPL", period: "1y", timeframe: "1d" },
+                    params: {
+                      symbol: DEFAULT_SYMBOL,
+                      period: BACKTEST_DATA_PERIOD,
+                      timeframe: DEFAULT_TIMEFRAME,
+                      viewRange: DEFAULT_VIEW_RANGE,
+                    },
                   };
                 }
                 return next;
@@ -328,7 +369,12 @@ function ChatColumn() {
                     runId: backtestRes.run_id,
                     code: backtestRes.program_code,
                     spec,
-                    params: { symbol: "AAPL", period: "1y", timeframe: "1d" },
+                    params: {
+                      symbol: DEFAULT_SYMBOL,
+                      period: BACKTEST_DATA_PERIOD,
+                      timeframe: DEFAULT_TIMEFRAME,
+                      viewRange: DEFAULT_VIEW_RANGE,
+                    },
                   },
                 })
               );
@@ -597,7 +643,7 @@ function ChatColumn() {
       </div>
 
       {fullscreenCode && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 bg-[#050507]">
           <div className="absolute inset-6 lpft-card">
             <div className="shrink-0 px-4 py-3 border-b border-[var(--border-subtle)] flex items-center justify-between">
               <p className="text-[12px] text-[var(--text-secondary)]">Codice</p>
@@ -631,16 +677,16 @@ function BacktestColumn() {
     { entry_time: number; exit_time: number; entry_price: number; exit_price: number; pnl_pct: number; pnl: number }[]
   >([]);
   const [tab, setTab] = useState<"backtest" | "metrics" | "parameters" | "trade">("backtest");
-  const [range, setRange] = useState<"5y" | "2y" | "1y" | "6m" | "3m" | "1m">("1y");
+  const [range, setRange] = useState<"5y" | "2y" | "1y" | "6m" | "3m" | "1m">(DEFAULT_VIEW_RANGE);
   const [fullscreen, setFullscreen] = useState(false);
   const [fullscreenTab, setFullscreenTab] = useState<null | "metrics" | "parameters" | "trade">(null);
   const [programCode, setProgramCode] = useState<string>("");
   const [strategySpec, setStrategySpec] = useState<StrategySpec | null>(null);
-  const [runParams, setRunParams] = useState<{ symbol?: string; period?: string; timeframe?: string } | null>(null);
+  const [runParams, setRunParams] = useState<{ symbol?: string; period?: string; timeframe?: string; viewRange?: string } | null>(null);
 
   useEffect(() => {
     const handler = (
-      e: CustomEvent<{ runId: number; code?: string; spec?: StrategySpec; params?: { symbol?: string; period?: string; timeframe?: string } }>
+      e: CustomEvent<{ runId: number; code?: string; spec?: StrategySpec; params?: { symbol?: string; period?: string; timeframe?: string; viewRange?: string } }>
     ) => {
       setRunId(e.detail.runId);
       setRun(null);
@@ -652,7 +698,7 @@ function BacktestColumn() {
       setStrategySpec(e.detail.spec ?? null);
       setRunParams(e.detail.params ?? null);
       setTab("backtest");
-      setRange("1y");
+      setRange(DEFAULT_VIEW_RANGE);
     };
     window.addEventListener("lpft-backtest-run", handler as EventListener);
     return () => window.removeEventListener("lpft-backtest-run", handler as EventListener);
@@ -1002,7 +1048,7 @@ function BacktestColumn() {
         {tab === "parameters" && (
           <div className="lpft-panel p-4">
             <p className="lpft-panel-header mb-3">Parameters</p>
-            <MetricsTable rows={parameterRows} />
+            <ParameterTable rows={parameterRows} />
           </div>
         )}
 
@@ -1053,7 +1099,7 @@ function BacktestColumn() {
       </div>
 
       {fullscreen && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 bg-[#050507]">
           <div className="absolute inset-6 lpft-card">
             <div className="shrink-0 px-4 py-3 border-b border-[var(--border-subtle)] flex items-center justify-between">
               <p className="text-[12px] text-[var(--text-secondary)]">Equity curve</p>
@@ -1075,7 +1121,7 @@ function BacktestColumn() {
       )}
 
       {fullscreenTab && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 bg-[#050507]">
           <div className="absolute inset-6 lpft-card">
             <div className="shrink-0 px-4 py-3 border-b border-[var(--border-subtle)] flex items-center justify-between">
               <p className="text-[12px] text-[var(--text-secondary)]">
@@ -1103,7 +1149,7 @@ function BacktestColumn() {
                   ]}
                 />
               )}
-              {fullscreenTab === "parameters" && <MetricsTable rows={parameterRows} />}
+              {fullscreenTab === "parameters" && <ParameterTable rows={parameterRows} />}
               {fullscreenTab === "trade" && <TradesTable trades={filteredTrades} />}
             </div>
           </div>
