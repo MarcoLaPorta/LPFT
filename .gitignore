@@ -4,6 +4,7 @@
 # Node / Next
 node_modules/
 .next/
+.next-dev/
 dist/
 build/
 npm-debug.log*
@@ -14,6 +15,7 @@ pnpm-debug.log*
 # Python
 __pycache__/
 *.py[cod]
+.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -31,6 +33,10 @@ venv/
 .vscode/
 
 # Runtime / generated storage
+*.db
+*.sqlite
+*.sqlite3
+*.rdb
 storage/artifacts/
 storage/datasets/
 storage/*.db
