@@ -1,0 +1,74 @@
+# LPFT: stack completo con Docker
+# Uso: cd infra && docker compose up -d
+# API: http://localhost:8000   Docs: http://localhost:8000/docs
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: lpft
+      POSTGRES_USER: lpft
+      POSTGRES_PASSWORD: lpft
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lpft -d lpft"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ../services/api
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      LPFT_DATABASE_URL: "postgresql+psycopg://lpft:lpft@postgres:5432/lpft"
+      LPFT_REDIS_URL: "redis://redis:6379/0"
+      LPFT_STORAGE_DIR: "/storage"
+      LPFT_ANTHROPIC_API_KEY: ${LPFT_ANTHROPIC_API_KEY:-}
+    volumes:
+      - ../storage:/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ../services/worker
+      dockerfile: Dockerfile
+    environment:
+      LPFT_DATABASE_URL: "postgresql+psycopg://lpft:lpft@postgres:5432/lpft"
+      LPFT_REDIS_URL: "redis://redis:6379/0"
+      LPFT_STORAGE_DIR: "/storage"
+      LPFT_ALPHA_VANTAGE_API_KEY: ${LPFT_ALPHA_VANTAGE_API_KEY:-}
+    volumes:
+      - ../storage:/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  redis_data:

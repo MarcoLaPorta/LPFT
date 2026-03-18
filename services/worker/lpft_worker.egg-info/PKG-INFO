@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: lpft-worker
+Version: 0.1.0
+Requires-Python: >=3.11
+Requires-Dist: rq>=1.16
+Requires-Dist: redis>=5.0
+Requires-Dist: sqlmodel>=0.0.14
+Requires-Dist: pandas>=2.0
+Requires-Dist: numpy>=1.24
+Requires-Dist: yfinance>=0.2
+Requires-Dist: pydantic-settings>=2.2

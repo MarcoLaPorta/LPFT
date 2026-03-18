@@ -1,0 +1,7 @@
+rq>=1.16
+redis>=5.0
+sqlmodel>=0.0.14
+pandas>=2.0
+numpy>=1.24
+yfinance>=0.2
+pydantic-settings>=2.2

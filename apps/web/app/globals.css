@@ -1,0 +1,186 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Dark: più nero (meno blu) */
+  --bg-primary: #050507;
+  --bg-secondary: #07070a;
+  --bg-tertiary: #0b0b0f;
+  --surface-raised: #0a0a0f;
+  --surface-overlay: #0d0d14;
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --border-default: rgba(255, 255, 255, 0.12);
+  --border-strong: rgba(255, 255, 255, 0.18);
+  --text-primary: #e5e7eb;
+  --text-secondary: rgba(229, 231, 235, 0.72);
+  --text-tertiary: rgba(229, 231, 235, 0.5);
+  /* Unico accento: viola */
+  --accent: #7c3aed;
+  --accent-hover: #8b5cf6;
+  --accent-dark: #5b21b6;
+  --accent-muted: rgba(124, 58, 237, 0.18);
+  --accent-strong: rgba(124, 58, 237, 0.28);
+  --danger: #ff453a;
+  --danger-muted: rgba(255, 69, 58, 0.12);
+  --success: #32d74b;
+  --warning: #ffd60a;
+  --code-bg: #07070a;
+  --code-border: rgba(255, 255, 255, 0.1);
+  --code-text: rgba(229, 231, 235, 0.92);
+  /* Apple-like: raggi più ampi e morbidi */
+  --radius: 14px;
+  --radius-lg: 18px;
+  --radius-xl: 24px;
+  --shadow-card: 0 12px 40px rgba(0, 0, 0, 0.55);
+  --shadow-glow: 0 0 64px rgba(124, 58, 237, 0.06);
+}
+
+body {
+  --bg-card: var(--surface-raised);
+  --bg-elevated: var(--surface-overlay);
+  --border: var(--border-default);
+  --border-focus: var(--accent);
+  --text: var(--text-primary);
+  --text-muted: var(--text-secondary);
+  --text-faint: var(--text-tertiary);
+}
+
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  min-height: 100vh;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI", "Helvetica Neue", sans-serif;
+  letter-spacing: -0.01em;
+  font-feature-settings: "rlig" 1, "calt" 1;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+/* Card: sfondo viola a gradiente, bordi morbidi */
+.lpft-card {
+  /* Beelzebub-like: viola scuro, molto nero */
+  background: linear-gradient(
+    135deg,
+    rgba(88, 28, 135, 0.20) 0%,
+    rgba(58, 18, 96, 0.14) 22%,
+    rgba(0, 0, 0, 0.92) 68%,
+    rgba(0, 0, 0, 0.985) 100%
+  );
+  border: 1.25px solid var(--border-default);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+}
+
+.lpft-main {
+  display: flex;
+  flex-direction: row;
+  flex: 1 1 0%;
+  min-height: 0;
+  width: 100%;
+  gap: 20px;
+  padding: 20px;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.lpft-col-left {
+  flex: 0 0 calc(65% - 10px);
+  min-width: 0;
+}
+
+.lpft-col-right {
+  flex: 0 0 calc(35% - 10px);
+  min-width: 0;
+}
+
+.btn-primary {
+  background: rgba(124, 58, 237, 0.85) !important;
+  color: white !important;
+  font-weight: 500;
+  transition: background 0.2s ease, transform 0.05s ease;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+.btn-primary:hover:not(:disabled) {
+  background: rgba(124, 58, 237, 0.95) !important;
+}
+
+input[type="text"],
+input[type="number"],
+textarea,
+select {
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+input:focus,
+textarea:focus,
+select:focus {
+  border-color: var(--border-strong);
+  box-shadow: none;
+}
+
+.lpft-code-block {
+  background: var(--code-bg);
+  border: 1px solid var(--code-border);
+  border-radius: var(--radius-lg);
+  font-family: ui-monospace, "SF Mono", "Menlo", "Monaco", "Consolas", monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--code-text);
+  overflow: auto;
+}
+
+.lpft-reasoning-bar {
+  background: linear-gradient(180deg, rgba(168, 85, 247, 0.05) 0%, transparent 100%);
+  border-bottom: 1.25px solid var(--border-subtle);
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: var(--border-default);
+  border-radius: 3px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: var(--border-strong);
+}
+
+@keyframes lpft-fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.lpft-reasoning-phrase {
+  animation: lpft-fade-in-up 0.25s ease-out;
+}
+
+/* Pannelli interni: bordi morbidi, sfondo con gradiente viola */
+.lpft-panel {
+  border: 1.25px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: rgba(0, 0, 0, 0.35);
+}
+.lpft-panel-header {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
