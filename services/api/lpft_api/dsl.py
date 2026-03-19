@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Annotated, Literal, Union
+from typing import Literal, Union
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -20,13 +20,22 @@ PriceField = Literal["open", "high", "low", "close"]
 
 class StrategyKind(str, Enum):
     sma_crossover = "sma_crossover"
+    ema_crossover = "ema_crossover"
     rsi = "rsi"
     macd = "macd"
     bollinger = "bollinger"
+    breakout = "breakout"
+    mean_reversion = "mean_reversion"
     python = "python"
 
 
 class SmaCrossoverParams(BaseModel):
+    fast: int = Field(ge=1, le=200)
+    slow: int = Field(ge=1, le=200)
+    price: PriceField = "close"
+
+
+class EmaCrossoverParams(BaseModel):
     fast: int = Field(ge=1, le=200)
     slow: int = Field(ge=1, le=200)
     price: PriceField = "close"
@@ -52,21 +61,62 @@ class BollingerParams(BaseModel):
     price: PriceField = "close"
 
 
+class BreakoutParams(BaseModel):
+    lookback: int = Field(ge=2, le=250)
+    exit_lookback: int | None = Field(default=None, ge=2, le=250)
+    price: PriceField = "close"
+
+
+class MeanReversionParams(BaseModel):
+    period: int = Field(ge=5, le=250)
+    entry_z: float = Field(ge=0.5, le=5.0)
+    exit_z: float = Field(ge=0.0, le=4.0, default=0.5)
+    price: PriceField = "close"
+
+
 class PythonParams(BaseModel):
     code: str
 
 
 StrategyParams = Union[
     SmaCrossoverParams,
+    EmaCrossoverParams,
     RsiParams,
     MacdParams,
     BollingerParams,
+    BreakoutParams,
+    MeanReversionParams,
     PythonParams,
 ]
 
 
 class RiskParams(BaseModel):
     max_position_pct: float = Field(default=1.0, ge=0.01, le=1.0)
+    max_gross_exposure: float = Field(default=1.0, ge=0.01, le=2.0)
+    stop_loss_pct: float | None = Field(default=None, ge=0.001, le=0.5)
+    take_profit_pct: float | None = Field(default=None, ge=0.001, le=2.0)
+    trailing_stop_pct: float | None = Field(default=None, ge=0.001, le=0.5)
+    fee_bps: float = Field(default=0.0, ge=0.0, le=100.0)
+    slippage_bps: float = Field(default=0.0, ge=0.0, le=100.0)
+
+
+class ExecutionParams(BaseModel):
+    position_mode: Literal["long_only", "long_short"] = "long_only"
+    rebalance: Literal["equal_weight", "dynamic"] = "equal_weight"
+    entry_timing: Literal["next_bar_open", "bar_close"] = "next_bar_open"
+
+
+class DataRequirements(BaseModel):
+    market_model: Literal["ohlcv", "bid_ask", "order_book", "options"] = "ohlcv"
+    requires_intrabar: bool = False
+    asset_class: Literal["auto", "equity", "etf", "crypto"] = "auto"
+    provider_preference: Literal["auto", "yahoo", "stooq"] = "auto"
+    quality_policy: Literal["strict_gate", "quality_labels", "best_effort"] = "best_effort"
+    freshness_requirement: Literal["relaxed", "standard", "strict"] = "standard"
+    coverage_requirement: Literal["relaxed", "standard", "strict"] = "standard"
+    corporate_actions_required: bool = False
+    market: str | None = None
+    notes: str | None = None
 
 
 class Universe(BaseModel):
@@ -74,25 +124,94 @@ class Universe(BaseModel):
     timeframe: Timeframe = Timeframe.d1
 
 
+def _default_universe() -> Universe:
+    return Universe(symbols=["AAPL"], timeframe=Timeframe.d1)
+
+
 class StrategySpec(BaseModel):
     kind: StrategyKind
     params: StrategyParams
     risk: RiskParams = Field(default_factory=RiskParams)
-    universe: Universe
+    universe: Universe = Field(default_factory=_default_universe)
+    execution: ExecutionParams = Field(default_factory=ExecutionParams)
+    data: DataRequirements = Field(default_factory=DataRequirements)
 
     @model_validator(mode="before")
     @classmethod
     def parse_params_from_kind(cls, data: dict):
         if not isinstance(data, dict):
             return data
+        if not data.get("universe"):
+            data = {**data, "universe": {"symbols": ["AAPL"], "timeframe": "1d"}}
+        if not data.get("execution"):
+            data = {**data, "execution": {"position_mode": "long_only", "rebalance": "equal_weight", "entry_timing": "next_bar_open"}}
+        if not data.get("data"):
+            data = {
+                **data,
+                "data": {
+                    "market_model": "ohlcv",
+                    "requires_intrabar": False,
+                    "asset_class": "auto",
+                    "provider_preference": "auto",
+                    "quality_policy": "best_effort",
+                    "freshness_requirement": "standard",
+                    "coverage_requirement": "standard",
+                    "corporate_actions_required": False,
+                },
+            }
         kind = data.get("kind")
         params = data.get("params")
+        if kind == "python" and isinstance(params, str):
+            data = {**data, "params": {"code": params}}
+            params = data["params"]
+        if kind == "bollinger" and isinstance(params, dict):
+            normalized_params = dict(params)
+            if "std" not in normalized_params:
+                if "std_dev" in normalized_params:
+                    normalized_params["std"] = normalized_params.pop("std_dev")
+                elif "stddev" in normalized_params:
+                    normalized_params["std"] = normalized_params.pop("stddev")
+                elif "stdev" in normalized_params:
+                    normalized_params["std"] = normalized_params.pop("stdev")
+            data = {**data, "params": normalized_params}
+            params = data["params"]
+        if kind == "breakout" and isinstance(params, dict):
+            normalized_params = dict(params)
+            if "lookback" not in normalized_params:
+                for alias in ("period", "window", "channel"):
+                    if alias in normalized_params:
+                        normalized_params["lookback"] = normalized_params.pop(alias)
+                        break
+            if "exit_lookback" not in normalized_params:
+                for alias in ("exit_period", "exit_window"):
+                    if alias in normalized_params:
+                        normalized_params["exit_lookback"] = normalized_params.pop(alias)
+                        break
+            data = {**data, "params": normalized_params}
+            params = data["params"]
+        if kind == "mean_reversion" and isinstance(params, dict):
+            normalized_params = dict(params)
+            if "entry_z" not in normalized_params:
+                for alias in ("z_entry", "zscore_entry", "entry_threshold"):
+                    if alias in normalized_params:
+                        normalized_params["entry_z"] = normalized_params.pop(alias)
+                        break
+            if "exit_z" not in normalized_params:
+                for alias in ("z_exit", "zscore_exit", "exit_threshold"):
+                    if alias in normalized_params:
+                        normalized_params["exit_z"] = normalized_params.pop(alias)
+                        break
+            data = {**data, "params": normalized_params}
+            params = data["params"]
         if isinstance(params, dict) and kind is not None:
             kind_to_type = {
                 "sma_crossover": SmaCrossoverParams,
+                "ema_crossover": EmaCrossoverParams,
                 "rsi": RsiParams,
                 "macd": MacdParams,
                 "bollinger": BollingerParams,
+                "breakout": BreakoutParams,
+                "mean_reversion": MeanReversionParams,
                 "python": PythonParams,
             }
             t = kind_to_type.get(kind)

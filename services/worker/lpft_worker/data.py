@@ -5,12 +5,13 @@ from pathlib import Path
 import pandas as pd
 
 from lpft_worker.config import settings
+from lpft_shared.market_data import dataset_path as shared_dataset_path
 
 PERIOD_ALIAS = {"1m": "1mo", "3m": "3mo", "6m": "6mo", "1y": "1y", "2y": "2y", "5y": "5y"}
 
 
 def dataset_path(filename: str) -> Path:
-    return Path(settings.storage_dir) / "datasets" / filename
+    return shared_dataset_path(Path(settings.storage_dir), filename)
 
 
 def load_ohlcv_csv(path: Path) -> pd.DataFrame:

@@ -5,9 +5,6 @@ import re
 import shutil
 import uuid
 from pathlib import Path
-import threading
-import time
-
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -15,14 +12,18 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from sqlmodel import Session, select
 
+from lpft_api.assistant import build_strategy_prompt, plan_assistant_turn, stream_answer
+from lpft_api.capabilities import CapabilityStatus, assess_strategy_spec
 from lpft_api.config import settings
 from lpft_api.db import Run, RunStatus, RunType, Strategy, engine, init_db
 from lpft_api.llm import generate_strategy_spec, generate_strategy_spec_stream
-from lpft_api.market_data import dataset_path, fetch_ohlcv_yahoo
-from lpft_api.inline_backtest import run_inline_backtest
-from lpft_api.program_llm import generate_program
+from lpft_api.inline_backtest import run_generate_signals, run_inline_backtest
+from lpft_api.program_llm import generate_program, repair_program
 from lpft_api.queue import get_queue
+from lpft_shared.engine import build_validation_ohlcv, extract_program_metadata, write_validation_artifact
+from lpft_shared.market_data import DataQualityError, DataRequest, canonicalize_symbol, load_market_data_bundle, load_market_data_snapshot
 from lpft_api.schemas import (
+    AssistantStreamRequest,
     DatasetFetchResponse,
     DatasetUploadResponse,
     GenerateAndBacktestRequest,
@@ -42,9 +43,24 @@ from lpft_api.schemas import (
 
 app = FastAPI(title="LPFT API", version="0.1.0")
 
-CORS_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
-# Accetta localhost / 127.0.0.1 con qualsiasi porta
-_CORS_ORIGIN_REGEX = re.compile(r"^http://(localhost|127\.0\.0\.1)(:\d+)?$", re.IGNORECASE)
+CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://0.0.0.0:3000",
+]
+# Accetta origin tipici di sviluppo locale:
+# localhost, 127.0.0.1, 0.0.0.0 e IP privati LAN con qualsiasi porta.
+_CORS_ORIGIN_REGEX = re.compile(
+    r"^http://("
+    r"localhost|"
+    r"127\.0\.0\.1|"
+    r"0\.0\.0\.0|"
+    r"10(?:\.\d{1,3}){3}|"
+    r"192\.168(?:\.\d{1,3}){2}|"
+    r"172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2}"
+    r")(:\d+)?$",
+    re.IGNORECASE,
+)
 
 
 def _is_allowed_origin(origin: str | None) -> bool:
@@ -94,8 +110,17 @@ class AddCorsToAllResponsesMiddleware(BaseHTTPMiddleware):
         return response
 
 
-# Regex che accetta http://localhost e http://127.0.0.1 con qualsiasi porta (es. :3000)
-CORS_ORIGIN_REGEX = r"http://(localhost|127\.0\.0\.1)(:\d+)?$"
+# Regex che accetta origin di sviluppo locale/LAN con qualsiasi porta (es. :3000)
+CORS_ORIGIN_REGEX = (
+    r"http://("
+    r"localhost|"
+    r"127\.0\.0\.1|"
+    r"0\.0\.0\.0|"
+    r"10(?:\.\d{1,3}){3}|"
+    r"192\.168(?:\.\d{1,3}){2}|"
+    r"172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2}"
+    r")(:\d+)?$"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -222,6 +247,151 @@ def _check_anthropic_key():
         )
 
 
+def _generate_valid_program(strategy_spec, *, symbol: str, timeframe: str) -> tuple[str, dict]:
+    code = generate_program(strategy_spec)
+    sample = build_validation_ohlcv(timeframe or "1d")
+    validation = {
+        "status": "valid",
+        "summary": "The compiled strategy passed shared-engine preflight validation.",
+        "warnings": [],
+    }
+    try:
+        run_generate_signals(code, sample)
+        return code, validation
+    except Exception as e:
+        validation["warnings"].append(str(e))
+        if getattr(strategy_spec.kind, "value", str(strategy_spec.kind)) != "python":
+            validation["status"] = "invalid"
+            validation["summary"] = "The deterministic strategy failed the shared-engine preflight validation."
+            raise
+        repaired = repair_program(strategy_spec, code, str(e))
+        run_generate_signals(repaired, sample)
+        validation["summary"] = "The custom Python strategy needed one repair pass before validation."
+        return repaired, validation
+
+
+def _preflight_market_data(program_code: str, *, symbol: str, period: str, timeframe: str) -> dict:
+    metadata = extract_program_metadata(program_code)
+    symbols = metadata.symbols or [symbol or "AAPL"]
+    snapshots = load_market_data_bundle(
+        symbols,
+        period=period or "1y",
+        timeframe=timeframe or metadata.timeframe or "1d",
+        asset_class=metadata.asset_class,
+        provider_preference=metadata.provider_preference,
+        quality_policy=metadata.quality_policy,
+        freshness_requirement=metadata.freshness_requirement,
+        coverage_requirement=metadata.coverage_requirement,
+        corporate_actions_required=metadata.corporate_actions_required,
+        market=metadata.market,
+        storage_dir=Path(settings.storage_dir),
+    )
+    data_sources = [snapshot.quality.to_dict() for snapshot in snapshots.values()]
+    overall_status = "validated_high_confidence"
+    if any(source.get("status") == "validated_with_warnings" for source in data_sources):
+        overall_status = "validated_with_warnings"
+    return {
+        "status": overall_status,
+        "summary": "Market data passed strategy-aware quality validation.",
+        "warnings": [warning for source in data_sources for warning in source.get("warnings", [])],
+        "data_sources": data_sources,
+    }
+
+
+def _inline_complete_run(run_id: int, *, symbol: str, period: str, timeframe: str, program_code: str) -> None:
+    try:
+        with Session(engine) as session:
+            run = session.get(Run, run_id)
+            if run:
+                run.status = RunStatus.running
+                run.error = None
+                session.add(run)
+                session.commit()
+        output_dir = Path(settings.storage_dir) / "artifacts" / f"run_{run_id}"
+        run_inline_backtest(
+            symbol=symbol or "AAPL",
+            period=period or "1y",
+            timeframe=timeframe or "1d",
+            program_code=program_code,
+            output_dir=output_dir,
+            storage_dir=Path(settings.storage_dir),
+        )
+        with Session(engine) as session:
+            run = session.get(Run, run_id)
+            if run:
+                run.status = RunStatus.completed
+                run.error = None
+                session.add(run)
+                session.commit()
+    except Exception as e:
+        if isinstance(e, DataQualityError):
+            metadata = extract_program_metadata(program_code)
+            write_validation_artifact(
+                Path(settings.storage_dir) / "artifacts" / f"run_{run_id}",
+                {
+                    "status": "rejected",
+                    "engine_version": metadata.engine_version,
+                    "artifact_type": metadata.artifact_type,
+                    "strategy_kind": metadata.strategy_kind,
+                    "position_mode": metadata.position_mode,
+                    "symbols_requested": metadata.symbols,
+                    "symbols_used": [],
+                    "capability_status": metadata.capability_status,
+                    "capability_summary": metadata.capability_summary,
+                    "warnings": metadata.warnings,
+                    "data_policy": {
+                        "asset_class": metadata.asset_class,
+                        "provider_preference": metadata.provider_preference,
+                        "quality_policy": metadata.quality_policy,
+                        "freshness_requirement": metadata.freshness_requirement,
+                        "coverage_requirement": metadata.coverage_requirement,
+                        "corporate_actions_required": metadata.corporate_actions_required,
+                        "market": metadata.market,
+                    },
+                    "data_error": e.report,
+                },
+                program_code,
+            )
+        with Session(engine) as session:
+            run = session.get(Run, run_id)
+            if run:
+                run.status = RunStatus.failed
+                run.error = e.report.get("summary", str(e)) if isinstance(e, DataQualityError) else str(e)
+                session.add(run)
+                session.commit()
+
+
+def _enqueue_backtest_with_fallback(run_id: int, *, symbol: str, period: str, timeframe: str, program_code: str) -> None:
+    try:
+        q = get_queue()
+        q.enqueue("lpft_worker.jobs.run_backtest_job", run_id, job_id=f"run_{run_id}")
+    except Exception:
+        _inline_complete_run(
+            run_id,
+            symbol=symbol,
+            period=period,
+            timeframe=timeframe,
+            program_code=program_code,
+        )
+
+
+def _create_program_run(*, program_code: str, symbol: str, period: str, timeframe: str) -> int:
+    with Session(engine) as session:
+        run = Run(
+            strategy_id=None,
+            run_type=RunType.backtest,
+            status=RunStatus.pending,
+            program_code=program_code,
+            period=period,
+            timeframe=timeframe,
+            symbol=symbol,
+        )
+        session.add(run)
+        session.commit()
+        session.refresh(run)
+        return int(run.id)
+
+
 def _stream_generate_strategy(description: str, origin: str | None):
     """Generator SSE: eventi data con type=reasoning chunk o type=spec."""
     try:
@@ -252,6 +422,156 @@ def api_generate_strategy_stream(request: Request, body: GenerateStrategyRequest
     )
 
 
+def _stream_assistant(body: AssistantStreamRequest):
+    try:
+        try:
+            plan = plan_assistant_turn(
+                body.messages,
+                current_run_id=body.current_run_id,
+                current_code=body.current_code,
+                current_spec=body.current_spec,
+                symbol=body.symbol,
+                period=body.period,
+                timeframe=body.timeframe,
+            )
+        except Exception:
+            for chunk in stream_answer(
+                body.messages,
+                current_run_id=body.current_run_id,
+                current_code=body.current_code,
+                current_spec=body.current_spec,
+                symbol=body.symbol,
+                period=body.period,
+                timeframe=body.timeframe,
+            ):
+                if chunk:
+                    yield f"data: {_json.dumps({'type': 'assistant', 'chunk': chunk})}\n\n"
+            yield f"data: {_json.dumps({'type': 'done'})}\n\n"
+            return
+
+        if plan.mode == "clarify":
+            if plan.assistant_reply:
+                yield f"data: {_json.dumps({'type': 'assistant', 'chunk': plan.assistant_reply})}\n\n"
+            yield f"data: {_json.dumps({'type': 'clarification', 'question': plan.clarification_question or 'Which direction should I take?', 'options': plan.clarification_options or ['Explain the market idea', 'Build a strategy', 'Improve existing logic'], 'summary': plan.clarification_summary or [], 'missing': plan.clarification_missing or []})}\n\n"
+            yield f"data: {_json.dumps({'type': 'done'})}\n\n"
+            return
+
+        if plan.mode in {"answer", "analyze"}:
+            for chunk in stream_answer(
+                body.messages,
+                current_run_id=body.current_run_id,
+                current_code=body.current_code,
+                current_spec=body.current_spec,
+                symbol=body.symbol,
+                period=body.period,
+                timeframe=body.timeframe,
+                analysis_prompt=plan.analysis_prompt,
+            ):
+                if chunk:
+                    yield f"data: {_json.dumps({'type': 'assistant', 'chunk': chunk})}\n\n"
+            yield f"data: {_json.dumps({'type': 'done'})}\n\n"
+            return
+
+        if plan.assistant_reply:
+            yield f"data: {_json.dumps({'type': 'assistant', 'chunk': plan.assistant_reply})}\n\n"
+
+        strategy_prompt = build_strategy_prompt(
+            plan,
+            body.messages,
+            current_code=body.current_code,
+            current_spec=body.current_spec,
+            current_run_id=body.current_run_id,
+            symbol=body.symbol,
+            period=body.period,
+            timeframe=body.timeframe,
+        )
+
+        spec = None
+        for chunk, maybe_spec in generate_strategy_spec_stream(strategy_prompt):
+            if chunk is not None:
+                yield f"data: {_json.dumps({'type': 'reasoning', 'chunk': chunk})}\n\n"
+            elif maybe_spec is not None:
+                spec = maybe_spec
+                yield f"data: {_json.dumps({'type': 'spec', 'spec': spec.model_dump()})}\n\n"
+
+        if spec is None:
+            raise ValueError("Strategy generation did not return a valid spec")
+
+        capability = assess_strategy_spec(spec)
+        yield f"data: {_json.dumps({'type': 'capability', 'capability': capability.model_dump()})}\n\n"
+        if capability.status in {
+            CapabilityStatus.unsupported_missing_data,
+            CapabilityStatus.unsupported_with_conversion_path,
+        }:
+            yield f"data: {_json.dumps({'type': 'unsupported_strategy', 'detail': capability.summary, 'missing_requirements': capability.missing_requirements, 'conversion_suggestions': capability.conversion_suggestions, 'warnings': capability.warnings})}\n\n"
+            yield f"data: {_json.dumps({'type': 'done'})}\n\n"
+            return
+
+        code, validation = _generate_valid_program(
+            spec,
+            symbol=body.symbol or "AAPL",
+            timeframe=body.timeframe or "1d",
+        )
+        validation["warnings"] = list(dict.fromkeys([*capability.warnings, *validation.get("warnings", [])]))
+        if plan.should_backtest:
+            try:
+                data_validation = _preflight_market_data(
+                    code,
+                    symbol=body.symbol or "AAPL",
+                    period=body.period or "1y",
+                    timeframe=body.timeframe or "1d",
+                )
+            except DataQualityError as exc:
+                yield f"data: {_json.dumps({'type': 'validation', 'validation': {'status': 'invalid', 'summary': exc.report.get('summary', 'Market data quality rejected'), 'warnings': exc.report.get('warnings', []), 'data_sources': exc.report.get('symbol_errors', []) or [exc.report]}})}\n\n"
+                yield f"data: {_json.dumps({'type': 'unsupported_strategy', 'detail': exc.report.get('summary', 'Market data quality rejected'), 'missing_requirements': [], 'conversion_suggestions': ['Try daily bars', 'Use a different symbol', 'Reduce the lookback range'], 'warnings': exc.report.get('warnings', [])})}\n\n"
+                yield f"data: {_json.dumps({'type': 'done'})}\n\n"
+                return
+            validation["status"] = data_validation["status"]
+            validation["summary"] = data_validation["summary"]
+            validation["warnings"] = list(dict.fromkeys([*validation.get("warnings", []), *data_validation.get("warnings", [])]))
+            validation["data_sources"] = data_validation.get("data_sources", [])
+        yield f"data: {_json.dumps({'type': 'validation', 'validation': validation})}\n\n"
+        yield f"data: {_json.dumps({'type': 'code', 'code': code})}\n\n"
+
+        if plan.should_backtest:
+            run_id = _create_program_run(
+                program_code=code,
+                symbol=body.symbol or "AAPL",
+                period=body.period or "1y",
+                timeframe=body.timeframe or "1d",
+            )
+            _enqueue_backtest_with_fallback(
+                run_id,
+                symbol=body.symbol or "AAPL",
+                period=body.period or "1y",
+                timeframe=body.timeframe or "1d",
+                program_code=code,
+            )
+            yield f"data: {_json.dumps({'type': 'run_status', 'run_id': run_id, 'status': 'pending'})}\n\n"
+            yield f"data: {_json.dumps({'type': 'run', 'run_id': run_id, 'code': code, 'spec': spec.model_dump(), 'params': {'symbol': body.symbol or 'AAPL', 'period': body.period or '1y', 'timeframe': body.timeframe or '1d'}})}\n\n"
+
+        yield f"data: {_json.dumps({'type': 'done'})}\n\n"
+    except Exception as e:
+        yield f"data: {_json.dumps({'type': 'error', 'detail': str(e)})}\n\n"
+
+
+@app.post("/assistant/stream")
+def api_assistant_stream(request: Request, body: AssistantStreamRequest):
+    _check_anthropic_key()
+    headers = {
+        **_cors_headers(request.headers.get("origin")),
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(
+        _stream_assistant(body),
+        headers=headers,
+        media_type="text/event-stream",
+    )
+
+
 @app.post("/generate-strategy", response_model=GenerateStrategyResponse)
 def api_generate_strategy(request: Request, body: GenerateStrategyRequest):
     _check_anthropic_key()
@@ -270,7 +590,17 @@ def api_generate_strategy(request: Request, body: GenerateStrategyRequest):
 
 @app.post("/generate-program", response_model=GenerateProgramResponse)
 def api_generate_program(body: GenerateProgramRequest):
-    code = generate_program(body.strategy_spec)
+    capability = assess_strategy_spec(body.strategy_spec)
+    if capability.status in {
+        CapabilityStatus.unsupported_missing_data,
+        CapabilityStatus.unsupported_with_conversion_path,
+    }:
+        raise HTTPException(status_code=400, detail=capability.summary)
+    code, _validation = _generate_valid_program(
+        body.strategy_spec,
+        symbol=(body.strategy_spec.universe.symbols[0] if body.strategy_spec.universe.symbols else "AAPL"),
+        timeframe=body.strategy_spec.universe.timeframe.value if hasattr(body.strategy_spec.universe.timeframe, "value") else str(body.strategy_spec.universe.timeframe),
+    )
     return GenerateProgramResponse(program=GeneratedProgram(code=code, language="python"))
 
 
@@ -278,98 +608,45 @@ def api_generate_program(body: GenerateProgramRequest):
 def api_generate_and_backtest(request: Request, body: GenerateAndBacktestRequest):
     _check_anthropic_key()
     try:
-        code = generate_program(body.strategy_spec)
-        with Session(engine) as session:
-            run = Run(
-                strategy_id=None,
-                run_type=RunType.backtest,
-                status=RunStatus.pending,
-                program_code=code,
-                period=body.period,
-                timeframe=body.timeframe,
-                symbol=body.symbol,
-            )
-            session.add(run)
-            session.commit()
-            session.refresh(run)
-            run_id = run.id
-        def _inline_finish_if_stuck() -> None:
-            # Se Redis c'è ma il worker no, l'enqueue riesce ma il run resta pending.
-            # Dopo un breve delay, se è ancora pending, eseguiamo inline.
-            time.sleep(3.0)
-            with Session(engine) as session:
-                run = session.get(Run, run_id)
-                if not run or run.status != RunStatus.pending:
-                    return
-                run.status = RunStatus.running
-                run.error = None
-                session.add(run)
-                session.commit()
-            try:
-                output_dir = Path(settings.storage_dir) / "artifacts" / f"run_{run_id}"
-                run_inline_backtest(
-                    symbol=body.symbol or "AAPL",
-                    period=body.period or "1y",
-                    timeframe=body.timeframe or "1d",
-                    program_code=code,
-                    output_dir=output_dir,
-                )
-                with Session(engine) as session:
-                    run = session.get(Run, run_id)
-                    if run:
-                        run.status = RunStatus.completed
-                        run.error = None
-                        session.add(run)
-                        session.commit()
-            except Exception as e:
-                with Session(engine) as session:
-                    run = session.get(Run, run_id)
-                    if run:
-                        run.status = RunStatus.failed
-                        run.error = str(e)
-                        session.add(run)
-                        session.commit()
-
-        try:
-            q = get_queue()
-            q.enqueue("lpft_worker.jobs.run_backtest_job", run_id, job_id=f"run_{run_id}")
-            threading.Thread(target=_inline_finish_if_stuck, daemon=True).start()
-        except Exception:
-            # Fallback: esegui inline (senza Redis/worker) così la UI funziona sempre.
-            with Session(engine) as session:
-                run = session.get(Run, run_id)
-                if run:
-                    run.status = RunStatus.running
-                    run.error = None
-                    session.add(run)
-                    session.commit()
-            try:
-                output_dir = Path(settings.storage_dir) / "artifacts" / f"run_{run_id}"
-                run_inline_backtest(
-                    symbol=body.symbol or "AAPL",
-                    period=body.period or "1y",
-                    timeframe=body.timeframe or "1d",
-                    program_code=code,
-                    output_dir=output_dir,
-                )
-                with Session(engine) as session:
-                    run = session.get(Run, run_id)
-                    if run:
-                        run.status = RunStatus.completed
-                        run.error = None
-                        session.add(run)
-                        session.commit()
-            except Exception as e:
-                with Session(engine) as session:
-                    run = session.get(Run, run_id)
-                    if run:
-                        run.status = RunStatus.failed
-                        run.error = str(e)
-                        session.add(run)
-                        session.commit()
+        capability = assess_strategy_spec(body.strategy_spec)
+        if capability.status in {
+            CapabilityStatus.unsupported_missing_data,
+            CapabilityStatus.unsupported_with_conversion_path,
+        }:
+            raise HTTPException(status_code=400, detail=capability.summary)
+        code, _validation = _generate_valid_program(
+            body.strategy_spec,
+            symbol=body.symbol or "AAPL",
+            timeframe=body.timeframe or "1d",
+        )
+        _preflight_market_data(
+            code,
+            symbol=body.symbol or "AAPL",
+            period=body.period or "1y",
+            timeframe=body.timeframe or "1d",
+        )
+        run_id = _create_program_run(
+            program_code=code,
+            symbol=body.symbol,
+            period=body.period,
+            timeframe=body.timeframe,
+        )
+        _enqueue_backtest_with_fallback(
+            run_id,
+            symbol=body.symbol or "AAPL",
+            period=body.period or "1y",
+            timeframe=body.timeframe or "1d",
+            program_code=code,
+        )
         return GenerateAndBacktestResponse(run_id=run_id, program_code=code)
     except HTTPException:
         raise
+    except DataQualityError as e:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": e.report.get("summary", "Market data quality rejected")},
+            headers=_cors_headers(request.headers.get("origin")),
+        )
     except Exception as e:
         return JSONResponse(
             status_code=500,
@@ -386,90 +663,51 @@ def run_program(body: RunProgramRequest):
             raise HTTPException(status_code=404, detail="Run not found")
         if run.program_code is None:
             raise HTTPException(status_code=400, detail="Run has no program code")
-    def _inline_finish_if_stuck(program_code: str, symbol: str, period: str, timeframe: str) -> None:
-        time.sleep(3.0)
-        with Session(engine) as session:
-            run = session.get(Run, body.run_id)
-            if not run or run.status != RunStatus.pending:
-                return
-            run.status = RunStatus.running
-            run.error = None
+        try:
+            _preflight_market_data(
+                run.program_code,
+                symbol=run.symbol or "AAPL",
+                period=run.period or "1y",
+                timeframe=run.timeframe or "1d",
+            )
+        except DataQualityError as exc:
+            write_validation_artifact(
+                Path(settings.storage_dir) / "artifacts" / f"run_{body.run_id}",
+                {
+                    "status": "rejected",
+                    "summary": exc.report.get("summary", "Market data quality rejected"),
+                    "data_error": exc.report,
+                },
+                run.program_code or "",
+            )
+            run.status = RunStatus.failed
+            run.error = exc.report.get("summary", "Market data quality rejected")
             session.add(run)
             session.commit()
-        try:
-            output_dir = Path(settings.storage_dir) / "artifacts" / f"run_{body.run_id}"
-            run_inline_backtest(
-                symbol=symbol,
-                period=period,
-                timeframe=timeframe,
-                program_code=program_code,
-                output_dir=output_dir,
-            )
-            with Session(engine) as session:
-                run = session.get(Run, body.run_id)
-                if run:
-                    run.status = RunStatus.completed
-                    run.error = None
-                    session.add(run)
-                    session.commit()
-        except Exception as ee:
-            with Session(engine) as session:
-                run = session.get(Run, body.run_id)
-                if run:
-                    run.status = RunStatus.failed
-                    run.error = str(ee)
-                    session.add(run)
-                    session.commit()
-
+            raise HTTPException(status_code=400, detail=run.error)
+        run.status = RunStatus.pending
+        run.error = None
+        session.add(run)
+        session.commit()
     try:
         q = get_queue()
         q.enqueue("lpft_worker.jobs.run_backtest_job", body.run_id, job_id=f"run_{body.run_id}")
-        with Session(engine) as session:
-            run = session.get(Run, body.run_id)
-            symbol = run.symbol or "AAPL" if run else "AAPL"
-            period = run.period or "1y" if run else "1y"
-            timeframe = run.timeframe or "1d" if run else "1d"
-            code = run.program_code or "" if run else ""
-        threading.Thread(target=_inline_finish_if_stuck, args=(code, symbol, period, timeframe), daemon=True).start()
     except Exception:
-        # Fallback inline
         with Session(engine) as session:
             run = session.get(Run, body.run_id)
             if not run:
                 raise HTTPException(status_code=404, detail="Run not found")
-            run.status = RunStatus.running
-            run.error = None
-            session.add(run)
-            session.commit()
             symbol = run.symbol or "AAPL"
             period = run.period or "1y"
             timeframe = run.timeframe or "1d"
             code = run.program_code or ""
-        try:
-            output_dir = Path(settings.storage_dir) / "artifacts" / f"run_{body.run_id}"
-            run_inline_backtest(
-                symbol=symbol,
-                period=period,
-                timeframe=timeframe,
-                program_code=code,
-                output_dir=output_dir,
-            )
-            with Session(engine) as session:
-                run = session.get(Run, body.run_id)
-                if run:
-                    run.status = RunStatus.completed
-                    run.error = None
-                    session.add(run)
-                    session.commit()
-        except Exception as ee:
-            with Session(engine) as session:
-                run = session.get(Run, body.run_id)
-                if run:
-                    run.status = RunStatus.failed
-                    run.error = str(ee)
-                    session.add(run)
-                    session.commit()
-            raise HTTPException(status_code=500, detail=str(ee)) from ee
+        _inline_complete_run(
+            body.run_id,
+            symbol=symbol,
+            period=period,
+            timeframe=timeframe,
+            program_code=code,
+        )
     return RunProgramResponse(run_id=body.run_id, status=RunStatus.pending)
 
 
@@ -505,13 +743,38 @@ async def upload_dataset(file: UploadFile):
 
 
 @app.post("/datasets/fetch", response_model=DatasetFetchResponse)
-def fetch_dataset(symbol: str = "AAPL", period: str = "1y", interval: str = "1d"):
-    df = fetch_ohlcv_yahoo(symbol, period=period, interval=interval)
-    if df.empty:
-        raise HTTPException(status_code=400, detail="No data for symbol/period")
-    datasets_dir = Path(settings.storage_dir) / "datasets"
-    datasets_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{symbol}_{period}_{interval}.csv"
-    path = datasets_dir / filename
-    df.to_csv(path)
-    return DatasetFetchResponse(symbol=symbol, period=period, interval=interval, rows=len(df), path=str(path))
+def fetch_dataset(
+    symbol: str = "AAPL",
+    period: str = "1y",
+    interval: str = "1d",
+    asset_class: str = "auto",
+    provider_preference: str = "auto",
+    quality_policy: str = "best_effort",
+):
+    try:
+        snapshot = load_market_data_snapshot(
+            DataRequest(
+                symbol=symbol,
+                period=period,
+                timeframe=interval,
+                asset_class=asset_class,
+                provider_preference=provider_preference,
+                quality_policy=quality_policy,
+            ),
+            Path(settings.storage_dir),
+        )
+    except DataQualityError as exc:
+        raise HTTPException(status_code=400, detail=exc.report.get("summary", "No data for symbol/period")) from exc
+    return DatasetFetchResponse(
+        symbol=snapshot.canonical_symbol,
+        period=period,
+        interval=interval,
+        rows=len(snapshot.ohlcv),
+        path=snapshot.quality.cache_path,
+        provider_used=snapshot.provider_used,
+        asset_class=snapshot.asset_class,
+        quality_status=snapshot.quality.status,
+        freshness_status=snapshot.quality.freshness_status,
+        coverage_status=snapshot.quality.coverage_status,
+        warnings=snapshot.quality.warnings,
+    )

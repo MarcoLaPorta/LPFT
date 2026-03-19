@@ -9,12 +9,62 @@ from lpft_api.dsl import StrategySpec
 
 _client: Anthropic | None = None
 
-_prompt = """You are a trading strategy designer. Given a user description, output a single JSON object that conforms to StrategySpec: kind (sma_crossover|rsi|macd|bollinger|python), params (object per kind), risk (max_position_pct 0.01-1), universe (symbols list, timeframe 1m|5m|15m|30m|1h|1d). For python kind, params has "code" with a short Python snippet. Output ONLY the JSON object, no markdown, no explanation, no code fences."""
+_prompt = """You are a rigorous trading strategy designer. Given a user description, output a single JSON object that conforms to StrategySpec.
+
+Allowed kinds:
+- sma_crossover
+- ema_crossover
+- rsi
+- macd
+- bollinger
+- breakout
+- mean_reversion
+- python
+
+Required top-level fields:
+- kind
+- params
+- risk
+- universe
+- execution
+- data
+
+Rules:
+- Use built-in kinds whenever the request fits one.
+- Use python only for custom logic that cannot be expressed cleanly with the built-in kinds.
+- risk supports: max_position_pct 0.01-1, max_gross_exposure 0.01-2, optional stop_loss_pct, take_profit_pct, trailing_stop_pct, fee_bps, slippage_bps.
+- universe supports symbols list and timeframe 1m|5m|15m|30m|1h|1d.
+- execution supports position_mode (long_only|long_short), rebalance (equal_weight|dynamic), entry_timing (next_bar_open|bar_close).
+- data supports:
+  - market_model (ohlcv|bid_ask|order_book|options)
+  - requires_intrabar boolean
+  - asset_class (auto|equity|etf|crypto)
+  - provider_preference (auto|yahoo|stooq)
+  - quality_policy (strict_gate|quality_labels|best_effort)
+  - freshness_requirement (relaxed|standard|strict)
+  - coverage_requirement (relaxed|standard|strict)
+  - corporate_actions_required boolean
+  - market optional string
+- For python kind, params has "code" with a concise but production-quality Python snippet.
+- Use confirmed user requirements whenever they are provided.
+- If some details are still missing, use conservative practical defaults and record the most important assumptions in data.notes.
+- Do not leave major fields ambiguous or empty.
+- Prefer robust, tradable logic over clever but fragile logic.
+
+Output ONLY the JSON object, no markdown, no explanation, no code fences."""
 
 # Prompt per streaming: prima ragiona in italiano, poi output ---JSON--- e il JSON
 _prompt_stream = """You are an expert algo trading assistant. For the user's request:
-1. Think in simple English using short, clear sentences only. Keep the reasoning concise and practical. Do not dump raw parameter lists unless necessary.
-2. Then write exactly the line ---JSON--- and immediately after it output one valid StrategySpec JSON object: kind (sma_crossover|rsi|macd|bollinger|python), params, risk (max_position_pct 0.01-1), universe (symbols, timeframe 1m|5m|15m|30m|1h|1d).
+1. Think in simple English using very short status-style sentences only.
+2. Each sentence must briefly describe what you are doing right now, like: "Reviewing the current logic." "Tightening the entry rules." "Preparing the new spec."
+3. Keep each sentence concise, practical, and easy to show as a single live status line. Do not dump raw parameter lists unless necessary.
+4. Then write exactly the line ---JSON--- and immediately after it output one valid StrategySpec JSON object with:
+   - kind (sma_crossover|ema_crossover|rsi|macd|bollinger|breakout|mean_reversion|python)
+   - params
+   - risk
+   - universe
+   - execution
+   - data
 No markdown and no explanation after the JSON."""
 
 MAX_TOKENS_STRATEGY = 4096  # risposte più lunghe per strategie complesse
@@ -62,7 +112,10 @@ def _extract_json_from_text(s: str) -> str:
 def generate_strategy_spec(user_prompt: str) -> StrategySpec:
     schema_hint = (
         'Example: {"kind":"sma_crossover","params":{"fast":10,"slow":20,"price":"close"},'
-        '"risk":{"max_position_pct":0.2},"universe":{"symbols":["AAPL"],"timeframe":"1d"}}'
+        '"risk":{"max_position_pct":0.2,"max_gross_exposure":1.0,"fee_bps":2.0,"slippage_bps":1.0},'
+        '"universe":{"symbols":["AAPL"],"timeframe":"1d"},'
+        '"execution":{"position_mode":"long_only","rebalance":"equal_weight","entry_timing":"next_bar_open"},'
+        '"data":{"market_model":"ohlcv","requires_intrabar":false,"asset_class":"equity","provider_preference":"auto","quality_policy":"best_effort","freshness_requirement":"standard","coverage_requirement":"standard","corporate_actions_required":true,"notes":"Assumptions are conservative and based on the confirmed user inputs."}}'
     )
     client = _get_client()
     call = client.messages.create(
@@ -110,7 +163,10 @@ def generate_strategy_spec_stream(user_prompt: str):
     client = _get_client()
     schema_hint = (
         'Esempio JSON: {"kind":"sma_crossover","params":{"fast":10,"slow":20,"price":"close"},'
-        '"risk":{"max_position_pct":0.2},"universe":{"symbols":["AAPL"],"timeframe":"1d"}}'
+        '"risk":{"max_position_pct":0.2,"max_gross_exposure":1.0,"fee_bps":2.0,"slippage_bps":1.0},'
+        '"universe":{"symbols":["AAPL"],"timeframe":"1d"},'
+        '"execution":{"position_mode":"long_only","rebalance":"equal_weight","entry_timing":"next_bar_open"},'
+        '"data":{"market_model":"ohlcv","requires_intrabar":false,"asset_class":"equity","provider_preference":"auto","quality_policy":"best_effort","freshness_requirement":"standard","coverage_requirement":"standard","corporate_actions_required":true,"notes":"Assumptions are conservative and based on the confirmed user inputs."}}'
     )
     full = ""
     yielded_len = 0

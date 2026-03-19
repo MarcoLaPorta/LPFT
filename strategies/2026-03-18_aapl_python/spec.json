@@ -1,0 +1,15 @@
+{
+  "kind": "python",
+  "params": {
+    "code": "import pandas as pd\nimport numpy as np\n\ndef strategy(data):\n    data['sma200'] = data['close'].rolling(200).mean()\n    data['rsi'] = calculate_rsi(data['close'], 14)\n    data['bb_upper'], data['bb_lower'] = calculate_bollinger_bands(data['close'], 20, 2)\n    \n    signals = pd.DataFrame(index=data.index)\n    signals['position'] = 0\n    \n    long_condition = (data['close'] > data['sma200']) & (data['rsi'] < 30) & (data['close'] < data['bb_lower'])\n    exit_condition = data['close'] > data['bb_upper']\n    \n    position = 0\n    entry_price = 0\n    days_held = 0\n    \n    for i in range(len(data)):\n        if position == 0 and long_condition.iloc[i]:\n            position = 1\n            entry_price = data['close'].iloc[i]\n            days_held = 0\n        elif position == 1:\n            days_held += 1\n            current_return = (data['close'].iloc[i] - entry_price) / entry_price\n            if exit_condition.iloc[i] or current_return <= -0.04 or days_held >= 10:\n                position = 0\n        \n        signals['position'].iloc[i] = position\n    \n    return signals\n\ndef calculate_rsi(prices, period):\n    delta = prices.diff()\n    gain = (delta.where(delta > 0, 0)).rolling(period).mean()\n    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()\n    rs = gain / loss\n    return 100 - (100 / (1 + rs))\n\ndef calculate_bollinger_bands(prices, period, std_dev):\n    sma = prices.rolling(period).mean()\n    std = prices.rolling(period).std()\n    upper = sma + (std * std_dev)\n    lower = sma - (std * std_dev)\n    return upper, lower"
+  },
+  "risk": {
+    "max_position_pct": 0.02
+  },
+  "universe": {
+    "symbols": [
+      "META"
+    ],
+    "timeframe": "1d"
+  }
+}

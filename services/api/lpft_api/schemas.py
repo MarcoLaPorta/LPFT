@@ -57,6 +57,12 @@ class DatasetFetchResponse(BaseModel):
     interval: str
     rows: int
     path: str | None
+    provider_used: str | None = None
+    asset_class: str | None = None
+    quality_status: str | None = None
+    freshness_status: str | None = None
+    coverage_status: str | None = None
+    warnings: list[str] = Field(default_factory=list)
 
 
 class GenerateStrategyRequest(BaseModel):
@@ -65,6 +71,21 @@ class GenerateStrategyRequest(BaseModel):
 
 class GenerateStrategyResponse(BaseModel):
     spec: StrategySpec
+
+
+class AssistantMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class AssistantStreamRequest(BaseModel):
+    messages: list[AssistantMessage] = Field(default_factory=list)
+    current_run_id: int | None = None
+    current_code: str | None = None
+    current_spec: StrategySpec | None = None
+    symbol: str = "AAPL"
+    period: str = "5y"
+    timeframe: str = "1d"
 
 
 class GenerateProgramRequest(BaseModel):

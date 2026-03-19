@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "WATCHPACK_POLLING=true next dev -H 0.0.0.0 -p 3000",
-    "dev:clean": "node ./scripts/safe-next-clean.mjs .next-dev 3000 && WATCHPACK_POLLING=true next dev -H 0.0.0.0 -p 3000",
+    "dev:clean": "rm -rf .next && WATCHPACK_POLLING=true next dev -H 0.0.0.0 -p 3000",
     "build:clean": "rm -rf .next && next build",
     "build": "next build",
     "start": "next start -p 3000",

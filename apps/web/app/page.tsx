@@ -4,8 +4,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   api,
   artifactUrl,
+  type CapabilityReport,
   type RunOut,
   type StrategySpec,
+  type ValidationSummary,
 } from "../lib/api";
 import { EquityChart, parseEquityCsv } from "./components/EquityChart";
 import type { LineData } from "lightweight-charts";
@@ -18,18 +20,26 @@ const BACKTEST_DATA_PERIOD = "5y";
 
 /** Estrae la frase corrente dal ragionamento (ultima frase o testo in corso). */
 function currentReasoningPhrase(reasoning: string): string {
-  const t = reasoning.trim();
-  if (!t) return "";
+  const normalized = reasoning
+    .replace(/---JSON---/gi, " ")
+    .replace(/---+/g, " ")
+    .replace(/```/g, " ")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return "Reviewing the request.";
   const lastEnd = Math.max(
-    t.lastIndexOf(". "),
-    t.lastIndexOf("! "),
-    t.lastIndexOf("? "),
-    t.lastIndexOf(".\n"),
-    t.lastIndexOf("!\n"),
-    t.lastIndexOf("?\n")
+    normalized.lastIndexOf(". "),
+    normalized.lastIndexOf("! "),
+    normalized.lastIndexOf("? ")
   );
-  if (lastEnd === -1) return t;
-  return t.slice(lastEnd + 1).trim() || t;
+  const candidate = (lastEnd === -1 ? normalized : normalized.slice(lastEnd + 1)).trim() || normalized;
+  const cleaned = candidate
+    .replace(/^[-–—.:;|/\\]+/, "")
+    .replace(/[-–—.:;|/\\]+$/, "")
+    .trim();
+  if (!cleaned || /^[-–—.:;|/\\]+$/.test(cleaned)) return "Reviewing the request.";
+  return cleaned;
 }
 
 type CodeTokenKind =
@@ -109,6 +119,91 @@ function renderPythonCode(code: string) {
       </span>
     );
   });
+}
+
+function renderAssistantText(text: string) {
+  const lines = text.split("\n");
+  return lines.map((line, lineIndex) => {
+    const parts = line.split(/(\*\*[^*]+\*\*)/g);
+    return (
+      <span key={`assistant-line-${lineIndex}`}>
+        {parts.map((part, partIndex) => {
+          const boldMatch = part.match(/^\*\*([^*]+)\*\*$/);
+          if (boldMatch) {
+            return (
+              <strong key={`assistant-part-${lineIndex}-${partIndex}`} className="font-semibold text-[var(--text-primary)]">
+                {boldMatch[1]}
+              </strong>
+            );
+          }
+          return <span key={`assistant-part-${lineIndex}-${partIndex}`}>{part}</span>;
+        })}
+        {lineIndex < lines.length - 1 ? "\n" : null}
+      </span>
+    );
+  });
+}
+
+function formatRunStatus(status: "idle" | "pending" | "running" | "completed" | "failed" | undefined) {
+  if (status === "completed") return "Backtest complete";
+  if (status === "failed") return "Backtest failed";
+  if (status === "pending") return "Queued for backtest";
+  if (status === "running") return "Running backtest";
+  return "Backtest ready";
+}
+
+function renderDataSources(
+  sources:
+    | Array<{
+        provider_requested?: string;
+        provider_used?: string;
+        asset_class?: string;
+        canonical_symbol?: string;
+        requested_symbol?: string;
+        freshness_status?: string;
+        coverage_status?: string;
+        status?: string;
+        rows?: number;
+        warnings?: string[];
+        fallback_used?: boolean;
+      }>
+    | undefined
+) {
+  if (!sources || sources.length === 0) return null;
+  return (
+    <div className="mt-3 space-y-2">
+      {sources.map((source, index) => (
+        <div
+          key={`${source.canonical_symbol ?? source.requested_symbol ?? "source"}-${index}`}
+          className="rounded-[16px] border border-[var(--border-subtle)] bg-[rgba(255,255,255,0.02)] px-3 py-2.5"
+        >
+          <p className="text-[12px] text-[var(--text-primary)]">
+            {(source.canonical_symbol ?? source.requested_symbol ?? "Dataset") +
+              (source.provider_used ? ` · ${source.provider_used}` : "")}
+          </p>
+          <p className="mt-1 text-[11px] text-[var(--text-tertiary)]">
+            {(source.asset_class ?? "unknown") +
+              (source.status ? ` · ${source.status}` : "") +
+              (source.freshness_status ? ` · freshness: ${source.freshness_status}` : "") +
+              (source.coverage_status ? ` · coverage: ${source.coverage_status}` : "") +
+              (typeof source.rows === "number" ? ` · rows: ${source.rows}` : "")}
+          </p>
+          {source.fallback_used && (
+            <p className="mt-1 text-[11px] text-[var(--text-tertiary)]">Fallback provider used.</p>
+          )}
+          {source.warnings && source.warnings.length > 0 && (
+            <div className="mt-1.5 space-y-1">
+              {source.warnings.map((warning, warningIndex) => (
+                <p key={`${warning}-${warningIndex}`} className="text-[11px] text-[var(--text-tertiary)] leading-relaxed">
+                  {warning}
+                </p>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function parseTradesCsv(csvText: string): {
@@ -354,12 +449,24 @@ type ChatMessage =
   | { role: "user"; content: string }
   | {
       role: "assistant";
+      content: string;
       reasoning: string;
       code: string;
+      runId?: number | null;
+      strategyFlow?: boolean;
       streaming?: boolean;
-      backtestStatus?: "idle" | "running" | "completed";
+      backtestStatus?: "idle" | "pending" | "running" | "completed" | "failed";
       spec?: StrategySpec | null;
       params?: { symbol?: string; period?: string; timeframe?: string; viewRange?: string } | null;
+      clarification?: { question: string; options: string[]; summary?: string[]; missing?: string[] } | null;
+      capability?: CapabilityReport | null;
+      validation?: ValidationSummary | null;
+      unsupported?: {
+        detail: string;
+        missing_requirements: string[];
+        conversion_suggestions: string[];
+        warnings: string[];
+      } | null;
     };
 
 function ChatColumn() {
@@ -372,20 +479,21 @@ function ChatColumn() {
   const [savingCode, setSavingCode] = useState<string | null>(null);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
 
-  const triggerBacktest = useCallback((runId: number) => {
-    window.dispatchEvent(new CustomEvent("lpft-backtest-run", { detail: { runId } }));
-  }, []);
-
-  const handleGenerate = async () => {
-    if (!input.trim() && attachments.length === 0) return;
+  const handleGenerate = async (overridePrompt?: string) => {
+    const basePrompt = overridePrompt ?? input.trim();
+    if (!basePrompt.trim() && attachments.length === 0) return;
     autoScrollRef.current = true;
     setError(null);
     setLoading(true);
+    const currentContext = [...messages]
+      .reverse()
+      .find((msg): msg is Extract<ChatMessage, { role: "assistant" }> => msg.role === "assistant" && (!!msg.code || !!msg.spec || !!msg.runId));
     const userPrompt = [
-      input.trim(),
+      basePrompt.trim(),
       ...(attachments.length > 0
         ? [
             "",
@@ -397,95 +505,227 @@ function ChatColumn() {
           ]
         : []),
     ].join("\n");
-    // Mostriamo in chat solo il prompt “umano”, evitando di stampare gli allegati completi.
-    setMessages((prev) => [...prev, { role: "user", content: input.trim() }]);
-    setInput("");
-    setAttachments([]);
+    const transcript = [
+      ...messages.map((msg) =>
+        msg.role === "user"
+          ? { role: "user" as const, content: msg.content }
+          : {
+              role: "assistant" as const,
+              content: [msg.content, msg.reasoning === "Reasoning complete" ? "" : msg.reasoning, msg.code ? "Generated code available." : ""]
+                .filter(Boolean)
+                .join("\n"),
+            }
+      ),
+      { role: "user" as const, content: userPrompt },
+    ];
+
+    setMessages((prev) => [...prev, { role: "user", content: basePrompt.trim() }]);
+    if (!overridePrompt) {
+      setInput("");
+      setAttachments([]);
+    }
     setMessages((prev) => [
       ...prev,
       {
         role: "assistant",
+        content: "",
         reasoning: "",
         code: "",
+        runId: null,
+        strategyFlow: false,
         streaming: true,
         backtestStatus: "idle",
         spec: null,
         params: null,
+        clarification: null,
+        capability: null,
+        validation: null,
+        unsupported: null,
       },
     ]);
     try {
-      await api.generate.strategyStream(userPrompt, {
+      await api.assistant.stream(
+        {
+          messages: transcript,
+          current_run_id: currentContext?.runId ?? null,
+          current_code: currentContext?.code ?? null,
+          current_spec: currentContext?.spec ?? null,
+          symbol: currentContext?.params?.symbol ?? DEFAULT_SYMBOL,
+          period: currentContext?.params?.period ?? BACKTEST_DATA_PERIOD,
+          timeframe: currentContext?.params?.timeframe ?? DEFAULT_TIMEFRAME,
+        },
+        {
+        onAssistantChunk(chunk) {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "assistant" && last.streaming) {
+              next[next.length - 1] = { ...last, content: last.content + chunk };
+            }
+            return next;
+          });
+        },
         onReasoningChunk(chunk) {
           setMessages((prev) => {
             const next = [...prev];
             const last = next[next.length - 1];
             if (last?.role === "assistant" && last.streaming) {
-              next[next.length - 1] = { ...last, reasoning: last.reasoning + chunk };
+              next[next.length - 1] = { ...last, reasoning: last.reasoning + chunk, strategyFlow: true };
             }
             return next;
           });
         },
         onSpec(spec) {
-          api.generate
-            .andBacktest({
-              strategy_spec: spec as StrategySpec,
-              period: BACKTEST_DATA_PERIOD,
-              timeframe: DEFAULT_TIMEFRAME,
-              symbol: DEFAULT_SYMBOL,
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "assistant" && last.streaming) {
+              next[next.length - 1] = {
+                ...last,
+                reasoning: "Reasoning complete",
+                spec: spec as StrategySpec,
+                strategyFlow: true,
+              };
+            }
+            return next;
+          });
+        },
+        onCode(code) {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "assistant") {
+              next[next.length - 1] = { ...last, code, strategyFlow: true };
+            }
+            return next;
+          });
+        },
+        onCapability(payload) {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "assistant") {
+              next[next.length - 1] = {
+                ...last,
+                capability: payload,
+              };
+            }
+            return next;
+          });
+        },
+        onValidation(payload) {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "assistant") {
+              next[next.length - 1] = {
+                ...last,
+                validation: payload,
+              };
+            }
+            return next;
+          });
+        },
+        onUnsupportedStrategy(payload) {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "assistant") {
+              next[next.length - 1] = {
+                ...last,
+                unsupported: payload,
+                strategyFlow: false,
+              };
+            }
+            return next;
+          });
+        },
+        onClarification(payload) {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "assistant") {
+              next[next.length - 1] = {
+                ...last,
+                clarification: payload,
+              };
+            }
+            return next;
+          });
+        },
+        onRun(payload) {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "assistant") {
+              next[next.length - 1] = {
+                ...last,
+                code: payload.code,
+                runId: payload.run_id,
+                strategyFlow: true,
+                backtestStatus: "pending",
+                spec: payload.spec,
+                params: {
+                  ...payload.params,
+                  viewRange: DEFAULT_VIEW_RANGE,
+                },
+                clarification: null,
+              };
+            }
+            return next;
+          });
+          window.dispatchEvent(
+            new CustomEvent("lpft-backtest-run", {
+              detail: {
+                runId: payload.run_id,
+                code: payload.code,
+                spec: payload.spec,
+                params: {
+                  ...payload.params,
+                  viewRange: DEFAULT_VIEW_RANGE,
+                },
+              },
             })
-            .then((backtestRes) => {
-              setMessages((prev) => {
-                const next = [...prev];
-                const last = next[next.length - 1];
-                if (last?.role === "assistant") {
-                  next[next.length - 1] = {
-                    role: "assistant",
-                    reasoning: last.reasoning,
-                    code: backtestRes.program_code,
-                    backtestStatus: "running",
-                    spec: spec as StrategySpec,
-                    params: {
-                      symbol: DEFAULT_SYMBOL,
-                      period: BACKTEST_DATA_PERIOD,
-                      timeframe: DEFAULT_TIMEFRAME,
-                      viewRange: DEFAULT_VIEW_RANGE,
-                    },
-                  };
-                }
-                return next;
-              });
-              window.dispatchEvent(
-                new CustomEvent("lpft-backtest-run", {
-                  detail: {
-                    runId: backtestRes.run_id,
-                    code: backtestRes.program_code,
-                    spec,
-                    params: {
-                      symbol: DEFAULT_SYMBOL,
-                      period: BACKTEST_DATA_PERIOD,
-                      timeframe: DEFAULT_TIMEFRAME,
-                      viewRange: DEFAULT_VIEW_RANGE,
-                    },
-                  },
-                })
-              );
-            })
-            .catch((e) => {
-              setError(e instanceof Error ? e.message : "Errore backtest");
-              setMessages((prev) => {
-                const next = [...prev];
-                const last = next[next.length - 1];
-                if (last?.role === "assistant") {
-                  next[next.length - 1] = { ...last, code: "", streaming: false, backtestStatus: "idle" };
-                }
-                return next;
-              });
-            })
-            .finally(() => setLoading(false));
+          );
+        },
+        onRunStatus(payload) {
+          setMessages((prev) => {
+            const next = [...prev];
+            for (let i = next.length - 1; i >= 0; i--) {
+              const msg = next[i];
+              if (msg?.role === "assistant" && msg.runId === payload.run_id) {
+                next[i] = {
+                  ...msg,
+                  backtestStatus: payload.status,
+                };
+                break;
+              }
+            }
+            return next;
+          });
+        },
+        onDone() {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "assistant" && last.streaming) {
+              next[next.length - 1] = { ...last, streaming: false };
+            }
+            return next;
+          });
+          setLoading(false);
         },
         onError(detail) {
           setError(detail);
-          setMessages((prev) => prev.slice(0, -1));
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "assistant") {
+              next[next.length - 1] = { ...last, streaming: false };
+              return next;
+            }
+            return prev.slice(0, -1);
+          });
           setLoading(false);
         },
       });
@@ -555,15 +795,34 @@ function ChatColumn() {
   }, []);
 
   useEffect(() => {
-    const handler = (e: CustomEvent<{ status: string }>) => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "0px";
+    const nextHeight = Math.min(Math.max(el.scrollHeight, 84), 188);
+    el.style.height = `${nextHeight}px`;
+  }, [input]);
+
+  useEffect(() => {
+    const handler = (e: CustomEvent<{ runId?: number; status: string }>) => {
       setMessages((prev) => {
         const next = [...prev];
         for (let i = next.length - 1; i >= 0; i--) {
           const msg = next[i];
-          if (msg?.role === "assistant" && msg.code) {
+          if (
+            msg?.role === "assistant" &&
+            msg.runId != null &&
+            (e.detail.runId == null || msg.runId === e.detail.runId)
+          ) {
             next[i] = {
               ...msg,
-              backtestStatus: e.detail.status === "completed" ? "completed" : "running",
+              backtestStatus:
+                e.detail.status === "completed"
+                  ? "completed"
+                  : e.detail.status === "failed"
+                    ? "failed"
+                    : e.detail.status === "pending"
+                      ? "pending"
+                      : "running",
             };
             break;
           }
@@ -574,8 +833,6 @@ function ChatColumn() {
     window.addEventListener("lpft-backtest-status", handler as EventListener);
     return () => window.removeEventListener("lpft-backtest-status", handler as EventListener);
   }, []);
-
-  const lastAssistant = messages.filter((m): m is ChatMessage & { role: "assistant" } => m.role === "assistant").pop();
 
   return (
     <>
@@ -588,10 +845,10 @@ function ChatColumn() {
           {messages.length === 0 && (
             <div className="flex flex-col items-center justify-center min-h-[240px] text-center px-4">
               <p className="text-[14px] text-[var(--text-secondary)]">
-                Descrivi la strategia in linguaggio naturale.
+                Ask about markets, indicators, strategies, results, or trading code.
               </p>
               <p className="text-[12px] text-[var(--text-tertiary)] mt-1.5">
-                Es: crossover SMA 10/30 su AAPL
+                Example: Explain RSI divergence, improve my AAPL strategy, or debug this backtest.
               </p>
             </div>
           )}
@@ -605,18 +862,142 @@ function ChatColumn() {
               </div>
             ) : (
               <div key={i} className="space-y-4">
-                {(msg.reasoning || msg.streaming) && (
+                {(msg.content || (msg.streaming && !msg.reasoning && !msg.code)) && (
+                  <div className="rounded-[20px] border border-[var(--border-subtle)] bg-[rgba(255,255,255,0.025)] px-4 py-3.5">
+                    <p className="text-[13px] text-[var(--text-secondary)] leading-relaxed whitespace-pre-wrap">
+                      {renderAssistantText(msg.content || "Thinking...")}
+                    </p>
+                  </div>
+                )}
+                {msg.capability && (
+                  <div className="rounded-[20px] border border-[var(--border-subtle)] bg-[rgba(255,255,255,0.025)] px-4 py-3.5">
+                    <p className="text-[11px] uppercase tracking-wider text-[var(--text-tertiary)] mb-1.5">
+                      Capability
+                    </p>
+                    <p className="text-[13px] text-[var(--text-secondary)] leading-relaxed">
+                      {msg.capability.summary}
+                    </p>
+                    <p className="mt-2 text-[12px] text-[var(--text-tertiary)]">
+                      {`Asset: ${msg.capability.asset_class} · Provider: ${msg.capability.provider_plan} · Policy: ${msg.capability.quality_policy}`}
+                    </p>
+                    {msg.capability.warnings.length > 0 && (
+                      <div className="mt-2 space-y-1">
+                        {msg.capability.warnings.map((warning, warningIndex) => (
+                          <p key={`${warning}-${warningIndex}`} className="text-[12px] text-[var(--text-tertiary)] leading-relaxed">
+                            {warning}
+                          </p>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {msg.validation && (
+                  <div className="rounded-[20px] border border-[var(--border-subtle)] bg-[rgba(255,255,255,0.025)] px-4 py-3.5">
+                    <p className="text-[11px] uppercase tracking-wider text-[var(--text-tertiary)] mb-1.5">
+                      Validation
+                    </p>
+                    <p className="text-[13px] text-[var(--text-secondary)] leading-relaxed">
+                      {msg.validation.summary}
+                    </p>
+                    {renderDataSources(msg.validation.data_sources)}
+                    {msg.validation.warnings.length > 0 && (
+                      <div className="mt-2 space-y-1">
+                        {msg.validation.warnings.map((warning, warningIndex) => (
+                          <p key={`${warning}-${warningIndex}`} className="text-[12px] text-[var(--text-tertiary)] leading-relaxed">
+                            {warning}
+                          </p>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {msg.unsupported && (
+                  <div className="rounded-[20px] border border-[rgba(185,28,28,0.25)] bg-[rgba(120,15,15,0.12)] px-4 py-3.5">
+                    <p className="text-[11px] uppercase tracking-wider text-[var(--text-tertiary)] mb-1.5">
+                      Unsupported Strategy
+                    </p>
+                    <p className="text-[13px] text-[var(--text-secondary)] leading-relaxed">
+                      {msg.unsupported.detail}
+                    </p>
+                    {msg.unsupported.missing_requirements.length > 0 && (
+                      <div className="mt-2 space-y-1">
+                        {msg.unsupported.missing_requirements.map((item, itemIndex) => (
+                          <p key={`${item}-${itemIndex}`} className="text-[12px] text-[var(--text-tertiary)] leading-relaxed">
+                            {item}
+                          </p>
+                        ))}
+                      </div>
+                    )}
+                    {msg.unsupported.conversion_suggestions.length > 0 && (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {msg.unsupported.conversion_suggestions.map((suggestion) => (
+                          <button
+                            key={suggestion}
+                            type="button"
+                            onClick={() => handleGenerate(suggestion)}
+                            disabled={loading}
+                            className="rounded-[999px] border border-[var(--border-subtle)] bg-[rgba(255,255,255,0.04)] px-3 py-1.5 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] disabled:opacity-50"
+                          >
+                            {suggestion}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {msg.clarification && (
+                  <div className="rounded-[20px] border border-[var(--border-subtle)] bg-[rgba(255,255,255,0.025)] px-4 py-3.5">
+                    {msg.clarification.summary && msg.clarification.summary.length > 0 && (
+                      <div className="mb-3 rounded-[16px] border border-[var(--border-subtle)] bg-[rgba(255,255,255,0.03)] px-3 py-2.5">
+                        <p className="text-[10px] uppercase tracking-wider text-[var(--text-tertiary)] mb-1.5">
+                          Strategia In Definizione
+                        </p>
+                        <div className="space-y-1">
+                          {msg.clarification.summary.map((line) => (
+                            <p key={line} className="text-[12px] text-[var(--text-secondary)] leading-relaxed">
+                              {line}
+                            </p>
+                          ))}
+                        </div>
+                        {msg.clarification.missing && msg.clarification.missing.length > 0 && (
+                          <p className="mt-2 text-[12px] text-[var(--warning)]">
+                            {`Da definire: ${msg.clarification.missing.join(", ")}`}
+                          </p>
+                        )}
+                      </div>
+                    )}
+                    <p className="text-[13px] text-[var(--text-secondary)] leading-relaxed">
+                      {msg.clarification.question}
+                    </p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {msg.clarification.options.map((option) => (
+                        <button
+                          key={option}
+                          type="button"
+                          onClick={() => handleGenerate(option)}
+                          disabled={loading}
+                          className="rounded-[999px] border border-[var(--border-subtle)] bg-[rgba(255,255,255,0.04)] px-3 py-1.5 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] disabled:opacity-50"
+                        >
+                          {option}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {(msg.reasoning || (msg.streaming && msg.strategyFlow)) && (
                   <div className="rounded-[20px] border border-[var(--border-subtle)] bg-[rgba(255,255,255,0.025)] px-4 py-3.5">
                     <p className="text-[11px] uppercase tracking-wider text-[var(--text-tertiary)] mb-1.5">
                       Reasoning
                     </p>
-                    <p className="text-[13px] text-[var(--text-secondary)] leading-relaxed whitespace-pre-wrap">
-                      {msg.reasoning || "Thinking..."}
+                    <p className="text-[13px] text-[var(--text-secondary)] leading-relaxed whitespace-nowrap overflow-hidden text-ellipsis">
+                      {msg.reasoning === "Reasoning complete"
+                        ? "Reasoning complete"
+                        : currentReasoningPhrase(msg.reasoning) || "Thinking..."}
                     </p>
                   </div>
                 )}
 
-                {(msg.code || msg.streaming) && (
+                {(msg.code || msg.strategyFlow) && (
                   <div className="lpft-panel overflow-hidden rounded-[20px]">
                     <div className="px-3.5 py-2 border-b border-[var(--border-subtle)] flex items-center justify-between bg-[var(--code-bg)]/80">
                       <span className="text-[11px] text-[var(--text-tertiary)] tracking-wider uppercase">
@@ -643,17 +1024,19 @@ function ChatColumn() {
                       </div>
                     </div>
                     <pre className="lpft-code-block p-4 text-[12px] whitespace-pre-wrap overflow-auto max-h-[360px] scrollbar-thin">
-                      {msg.streaming && !msg.code ? "Generazione in corso…" : renderPythonCode(msg.code)}
+                      {msg.streaming && !msg.code ? "Generating code..." : renderPythonCode(msg.code)}
                     </pre>
-                    {msg.code && (
-                      <div className="px-3.5 py-2 border-t border-[var(--border-subtle)] bg-[rgba(255,255,255,0.02)]">
-                        <p className="text-[12px] text-[var(--text-secondary)]">
-                          {msg.backtestStatus === "completed"
-                            ? "Backtest completed"
-                            : "Running backtest"}
-                        </p>
-                      </div>
-                    )}
+                  </div>
+                )}
+
+                {msg.runId != null && msg.code && (
+                  <div className="rounded-[20px] border border-[var(--border-subtle)] bg-[rgba(255,255,255,0.025)] px-4 py-3.5">
+                    <p className="text-[11px] uppercase tracking-wider text-[var(--text-tertiary)] mb-1.5">
+                      Backtest
+                    </p>
+                    <p className="text-[13px] text-[var(--text-secondary)] leading-relaxed whitespace-nowrap overflow-hidden text-ellipsis">
+                      {formatRunStatus(msg.backtestStatus)}
+                    </p>
                   </div>
                 )}
               </div>
@@ -681,7 +1064,7 @@ function ChatColumn() {
         </div>
       </div>
 
-      <div className="shrink-0 border-t border-[var(--border-subtle)] px-4 py-3">
+      <div className="shrink-0 px-4 py-3">
         <div className="mx-auto max-w-2xl flex flex-col gap-2.5">
           {attachments.length > 0 && (
             <div className="flex flex-wrap gap-2">
@@ -699,7 +1082,7 @@ function ChatColumn() {
             </div>
           )}
 
-          <div className="flex gap-2.5 items-end">
+          <div className="rounded-[24px] border border-[var(--border-subtle)] bg-[rgba(255,255,255,0.035)] px-3 py-3">
             <input
               ref={fileInputRef}
               type="file"
@@ -708,41 +1091,46 @@ function ChatColumn() {
               className="hidden"
               onChange={(e) => onPickFiles(e.target.files)}
             />
-          <textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                handleGenerate();
-              }
-            }}
-            placeholder="Descrivi la strategia…"
-            rows={4}
-            className="flex-1 min-h-[112px] max-h-[226px] px-5 py-4 rounded-[22px] bg-[var(--bg-tertiary)] border border-[var(--border-subtle)] text-[13px] leading-[1.7] tracking-[-0.01em] text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] resize-none focus:outline-none focus:ring-0 focus:border-[var(--border-subtle)]"
-            disabled={loading}
-          />
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={loading}
-            className="shrink-0 h-[42px] px-3 rounded-[22px] text-[12px] font-medium border border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] disabled:opacity-50 disabled:pointer-events-none bg-[rgba(255,255,255,0.04)]"
-            title="Attach CSV"
-          >
-            Attach CSV
-          </button>
-          <button
-            onClick={handleGenerate}
-            disabled={loading || (!input.trim() && attachments.length === 0)}
-            className="btn-primary shrink-0 h-[42px] px-5 rounded-[22px] text-[12px] font-medium disabled:opacity-50 disabled:pointer-events-none"
-          >
-            {loading ? "…" : "Genera"}
-          </button>
+            <textarea
+              ref={textareaRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  handleGenerate();
+                }
+              }}
+              placeholder="Ask anything about markets, strategies, indicators, or your trading code..."
+              rows={1}
+              className="w-full min-h-[84px] max-h-[188px] px-3 py-2 bg-transparent text-[13px] leading-[1.55] tracking-[-0.01em] text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] resize-none overflow-y-auto focus:outline-none"
+              disabled={loading}
+            />
+            <div className="mt-2 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={loading}
+                  className="shrink-0 h-[36px] w-[36px] rounded-[18px] text-[18px] leading-none font-medium border border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] disabled:opacity-50 disabled:pointer-events-none bg-[rgba(255,255,255,0.04)] flex items-center justify-center"
+                  title="Attach CSV"
+                  aria-label="Attach CSV"
+                >
+                  +
+                </button>
+              </div>
+              <button
+                onClick={() => {
+                  void handleGenerate();
+                }}
+                disabled={loading || (!input.trim() && attachments.length === 0)}
+                className="btn-primary shrink-0 h-[36px] px-4 rounded-[18px] text-[12px] font-medium disabled:opacity-50 disabled:pointer-events-none"
+              >
+                {loading ? "…" : "Send"}
+              </button>
+            </div>
           </div>
         </div>
-        <p className="mx-auto max-w-2xl mt-1.5 text-[10px] text-[var(--text-tertiary)] tracking-wider uppercase">
-          Invio per inviare
-        </p>
       </div>
 
       {fullscreenCode && (
@@ -786,6 +1174,49 @@ function BacktestColumn() {
   const [programCode, setProgramCode] = useState<string>("");
   const [strategySpec, setStrategySpec] = useState<StrategySpec | null>(null);
   const [runParams, setRunParams] = useState<{ symbol?: string; period?: string; timeframe?: string; viewRange?: string } | null>(null);
+  const [runValidation, setRunValidation] = useState<{
+    status?: string;
+    capability_summary?: string;
+    warnings?: string[];
+    strategy_kind?: string;
+    symbols_used?: string[];
+    data_policy?: {
+      asset_class?: string;
+      provider_preference?: string;
+      quality_policy?: string;
+      freshness_requirement?: string;
+      coverage_requirement?: string;
+      corporate_actions_required?: boolean;
+      market?: string | null;
+    };
+    data_sources?: Array<{
+      provider_requested?: string;
+      provider_used?: string;
+      asset_class?: string;
+      canonical_symbol?: string;
+      requested_symbol?: string;
+      freshness_status?: string;
+      coverage_status?: string;
+      status?: string;
+      rows?: number;
+      warnings?: string[];
+      fallback_used?: boolean;
+    }>;
+    data_error?: {
+      summary?: string;
+      warnings?: string[];
+      symbol_errors?: Array<{
+        summary?: string;
+        warnings?: string[];
+        canonical_symbol?: string;
+        requested_symbol?: string;
+        provider_used?: string;
+        freshness_status?: string;
+        coverage_status?: string;
+        status?: string;
+      }>;
+    };
+  } | null>(null);
 
   useEffect(() => {
     const handler = (
@@ -797,6 +1228,7 @@ function BacktestColumn() {
       setMetrics(null);
       setArtifacts([]);
       setTrades([]);
+      setRunValidation(null);
       setProgramCode(e.detail.code ?? "");
       setStrategySpec(e.detail.spec ?? null);
       setRunParams(e.detail.params ?? null);
@@ -816,10 +1248,11 @@ function BacktestColumn() {
         if (cancelled) return;
         setRun(r);
         if (r.status !== "completed" && r.status !== "failed") return;
-        const [list, csvRes, metricsRes] = await Promise.all([
+        const [list, csvRes, metricsRes, validationRes] = await Promise.all([
           api.runs.artifacts(runId),
           fetch(artifactUrl(runId, "equity.csv")),
           fetch(artifactUrl(runId, "metrics.json")),
+          fetch(artifactUrl(runId, "validation.json")),
         ]);
         if (cancelled) return;
         setArtifacts(list ?? []);
@@ -836,6 +1269,18 @@ function BacktestColumn() {
           }
         } else {
           setMetrics(null);
+        }
+        if (validationRes.ok) {
+          const validationText = await validationRes.text();
+          if (validationText.trim()) {
+            try {
+              setRunValidation(JSON.parse(validationText));
+            } catch {
+              setRunValidation(null);
+            }
+          }
+        } else {
+          setRunValidation(null);
         }
 
         // trades.csv (opzionale)
@@ -1032,6 +1477,56 @@ function BacktestColumn() {
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4 scrollbar-thin">
+        {runValidation && (
+          <div className="rounded-[20px] border border-[var(--border-subtle)] bg-[rgba(255,255,255,0.025)] px-4 py-3.5">
+            <p className="text-[11px] uppercase tracking-wider text-[var(--text-tertiary)] mb-1.5">
+              Validation
+            </p>
+            <p className="text-[13px] text-[var(--text-secondary)] leading-relaxed">
+              {runValidation.capability_summary ?? "Shared engine validation available."}
+            </p>
+            {runValidation.strategy_kind && (
+              <p className="mt-2 text-[12px] text-[var(--text-tertiary)]">
+                Kind: {runValidation.strategy_kind}
+                {runValidation.symbols_used && runValidation.symbols_used.length > 0
+                  ? ` · Symbols: ${runValidation.symbols_used.join(", ")}`
+                  : ""}
+              </p>
+            )}
+            {runValidation.data_policy && (
+              <p className="mt-2 text-[12px] text-[var(--text-tertiary)]">
+                {`Asset: ${runValidation.data_policy.asset_class ?? "auto"} · Provider: ${runValidation.data_policy.provider_preference ?? "auto"} · Policy: ${runValidation.data_policy.quality_policy ?? "best_effort"}`}
+              </p>
+            )}
+            {renderDataSources(runValidation.data_sources)}
+            {runValidation.data_error?.summary && (
+              <p className="mt-2 text-[12px] text-[var(--danger)] leading-relaxed">
+                {runValidation.data_error.summary}
+              </p>
+            )}
+            {runValidation.data_error?.symbol_errors &&
+              renderDataSources(
+                runValidation.data_error.symbol_errors.map((item) => ({
+                  canonical_symbol: item.canonical_symbol,
+                  requested_symbol: item.requested_symbol,
+                  provider_used: item.provider_used,
+                  freshness_status: item.freshness_status,
+                  coverage_status: item.coverage_status,
+                  status: item.status,
+                  warnings: item.warnings,
+                }))
+              )}
+            {runValidation.warnings && runValidation.warnings.length > 0 && (
+              <div className="mt-2 space-y-1">
+                {runValidation.warnings.map((warning, index) => (
+                  <p key={`${warning}-${index}`} className="text-[12px] text-[var(--text-tertiary)] leading-relaxed">
+                    {warning}
+                  </p>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         {tab === "backtest" && (
           <>
             <div className="flex items-center justify-between">
