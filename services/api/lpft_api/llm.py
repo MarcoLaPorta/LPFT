@@ -30,22 +30,28 @@ Required top-level fields:
 - data
 
 Rules:
+- Output a fully specified StrategySpec: every required field for the chosen kind must be present with explicit values (no reliance on hidden server defaults for params, universe, risk, execution, or data).
+- Backtest and future paper/live alignment: always set universe.symbols, universe.timeframe, data.history_period (1m|3m|6m|1y|2y|5y), data.asset_class, data.provider_preference, and risk/execution fields needed for OHLCV loading and portfolio rules.
+- If the user omits details: you choose sensible professional defaults for that strategy style, but list each non-trivial inference briefly in data.notes (e.g. "history_period=5y for robust sample", "entry_z=2 mean-reversion threshold") so the user can see and override them on the next message.
+- The user remains in control: prefer transparent, adjustable parameters; do not bury material assumptions; when choosing between plausible options, state the tradeoff in data.notes.
 - Use built-in kinds whenever the request fits one.
 - Use python only for custom logic that cannot be expressed cleanly with the built-in kinds.
 - risk supports: max_position_pct 0.01-1, max_gross_exposure 0.01-2, optional stop_loss_pct, take_profit_pct, trailing_stop_pct, fee_bps, slippage_bps.
-- universe supports symbols list and timeframe 1m|5m|15m|30m|1h|1d.
+- universe supports symbols list and timeframe 1m|5m|15m|30m|1h|1d (this is the bar interval for OHLCV ingestion and backtesting — set it from the user's horizon, e.g. intraday vs daily).
 - execution supports position_mode (long_only|long_short), rebalance (equal_weight|dynamic), entry_timing (next_bar_open|bar_close).
 - data supports:
   - market_model (ohlcv|bid_ask|order_book|options)
   - requires_intrabar boolean
   - asset_class (auto|equity|etf|crypto)
-  - provider_preference (auto|yahoo|stooq)
+  - provider_preference (auto|yahoo|stooq|alpaca; alpaca needs LPFT_ALPACA_API_KEY/SECRET; auto uses Yahoo first)
   - quality_policy (strict_gate|quality_labels|best_effort)
   - freshness_requirement (relaxed|standard|strict)
   - coverage_requirement (relaxed|standard|strict)
   - corporate_actions_required boolean
   - market optional string
+  - history_period required in practice: set 1m|3m|6m|1y|2y|5y to match backtest horizon; if the user did not say, pick the best default for the strategy and explain in data.notes
 - For python kind, params has "code" with a concise but production-quality Python snippet.
+- For mean_reversion, params MUST include "period", "entry_z", "exit_z", and "price". entry_z and exit_z are POSITIVE magnitudes in σ (the engine enters long when z <= -entry_z); never use negative numbers for these—use the absolute distance from the mean.
 - Use confirmed user requirements whenever they are provided.
 - If some details are still missing, use conservative practical defaults and record the most important assumptions in data.notes.
 - Do not leave major fields ambiguous or empty.
@@ -58,9 +64,7 @@ _prompt_stream = """You are an expert algo trading assistant. For the user's req
 1. Think in simple English using very short status-style sentences only.
 2. Each sentence must briefly describe what you are doing right now, like: "Reviewing the current logic." "Tightening the entry rules." "Preparing the new spec."
 3. Keep each sentence concise, practical, and easy to show as a single live status line. Do not dump raw parameter lists unless necessary.
-4. Then write exactly the line ---JSON--- and immediately after it output one valid StrategySpec JSON object with:
-   - kind (sma_crossover|ema_crossover|rsi|macd|bollinger|breakout|mean_reversion|python)
-   - params
+4. Then write exactly the line ---JSON--- and immediately after it output one complete StrategySpec JSON (all required params for that kind, full universe/data/risk/execution, data.history_period set, data.notes listing any values you inferred when the user was vague)
    - risk
    - universe
    - execution
@@ -115,7 +119,7 @@ def generate_strategy_spec(user_prompt: str) -> StrategySpec:
         '"risk":{"max_position_pct":0.2,"max_gross_exposure":1.0,"fee_bps":2.0,"slippage_bps":1.0},'
         '"universe":{"symbols":["AAPL"],"timeframe":"1d"},'
         '"execution":{"position_mode":"long_only","rebalance":"equal_weight","entry_timing":"next_bar_open"},'
-        '"data":{"market_model":"ohlcv","requires_intrabar":false,"asset_class":"equity","provider_preference":"auto","quality_policy":"best_effort","freshness_requirement":"standard","coverage_requirement":"standard","corporate_actions_required":true,"notes":"Assumptions are conservative and based on the confirmed user inputs."}}'
+        '"data":{"market_model":"ohlcv","requires_intrabar":false,"asset_class":"equity","provider_preference":"auto","quality_policy":"best_effort","freshness_requirement":"standard","coverage_requirement":"standard","corporate_actions_required":true,"history_period":"5y","notes":"List any inferred parameters here so the user can adjust them."}}'
     )
     client = _get_client()
     call = client.messages.create(
@@ -166,7 +170,7 @@ def generate_strategy_spec_stream(user_prompt: str):
         '"risk":{"max_position_pct":0.2,"max_gross_exposure":1.0,"fee_bps":2.0,"slippage_bps":1.0},'
         '"universe":{"symbols":["AAPL"],"timeframe":"1d"},'
         '"execution":{"position_mode":"long_only","rebalance":"equal_weight","entry_timing":"next_bar_open"},'
-        '"data":{"market_model":"ohlcv","requires_intrabar":false,"asset_class":"equity","provider_preference":"auto","quality_policy":"best_effort","freshness_requirement":"standard","coverage_requirement":"standard","corporate_actions_required":true,"notes":"Assumptions are conservative and based on the confirmed user inputs."}}'
+        '"data":{"market_model":"ohlcv","requires_intrabar":false,"asset_class":"equity","provider_preference":"auto","quality_policy":"best_effort","freshness_requirement":"standard","coverage_requirement":"standard","corporate_actions_required":true,"history_period":"5y","notes":"List any inferred parameters here so the user can adjust them."}}'
     )
     full = ""
     yielded_len = 0

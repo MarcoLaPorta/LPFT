@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     anthropic_api_key: str = ""
     llm_model: str = "claude-sonnet-4-20250514"
+    # Optional: US equity bars via Alpaca (read also by lpft_shared.market_data via same env names).
+    alpaca_api_key: str = ""
+    alpaca_secret_key: str = ""
 
     model_config = SettingsConfigDict(
         env_prefix="LPFT_",

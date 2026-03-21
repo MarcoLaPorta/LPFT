@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -228,6 +232,121 @@ def _fetch_yahoo(request: DataRequest) -> pd.DataFrame:
     return _normalize_ohlcv_frame(df)
 
 
+def _alpaca_api_credentials() -> tuple[str, str] | None:
+    key = str(os.getenv("LPFT_ALPACA_API_KEY", "") or "").strip()
+    secret = str(os.getenv("LPFT_ALPACA_SECRET_KEY", "") or "").strip()
+    if not key or not secret:
+        return None
+    return key, secret
+
+
+_ALPACA_TIMEFRAME = {
+    "1d": "1Day",
+    "1h": "1Hour",
+    "30m": "30Min",
+    "15m": "15Min",
+    "5m": "5Min",
+    "1m": "1Min",
+}
+
+
+def _alpaca_period_bounds(request: DataRequest) -> tuple[str, str]:
+    """ISO8601 UTC start/end for Alpaca bars API."""
+    period = normalize_period(request.period)
+    end = pd.Timestamp.now(tz="UTC")
+    months = {"1m": 1, "3m": 3, "6m": 6, "1y": 12, "2y": 24, "5y": 60}[period]
+    start = end - pd.DateOffset(months=months)
+    return (
+        start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+
+
+def _fetch_alpaca(request: DataRequest) -> pd.DataFrame:
+    """
+    Historical US stock/ETF bars via Alpaca Market Data API v2.
+    Requires LPFT_ALPACA_API_KEY and LPFT_ALPACA_SECRET_KEY (paper or live keys work for data).
+    Optional: LPFT_ALPACA_DATA_BASE_URL (default https://data.alpaca.markets),
+    LPFT_ALPACA_DATA_FEED=iex|sip (default iex, SIP needs paid subscription).
+    """
+    creds = _alpaca_api_credentials()
+    if creds is None:
+        raise ValueError(
+            "Alpaca market data requires LPFT_ALPACA_API_KEY and LPFT_ALPACA_SECRET_KEY"
+        )
+    asset = infer_asset_class(request.symbol, request.asset_class)
+    if asset == "crypto":
+        raise ValueError(
+            "Alpaca stock bars API does not support crypto in this integration; use provider_preference=yahoo or auto"
+        )
+    symbol = canonicalize_symbol(request.symbol, asset)
+    timeframe = _ALPACA_TIMEFRAME.get(normalize_timeframe(request.timeframe))
+    if not timeframe:
+        raise ValueError(f"Alpaca unsupported timeframe: {request.timeframe}")
+    start, end = _alpaca_period_bounds(request)
+    base_url = str(os.getenv("LPFT_ALPACA_DATA_BASE_URL", "") or "").strip().rstrip("/")
+    if not base_url:
+        base_url = "https://data.alpaca.markets"
+    feed = str(os.getenv("LPFT_ALPACA_DATA_FEED", "iex") or "iex").strip().lower()
+    if feed not in {"iex", "sip"}:
+        feed = "iex"
+    key_id, secret = creds
+    bars_path = f"{base_url}/v2/stocks/bars"
+    collected: list[dict[str, Any]] = []
+    next_token: str | None = None
+    while True:
+        params: dict[str, str | int] = {
+            "symbols": symbol,
+            "timeframe": timeframe,
+            "start": start,
+            "end": end,
+            "feed": feed,
+            "adjustment": "all",
+            "limit": 10000,
+        }
+        if next_token:
+            params["page_token"] = next_token
+        query = urllib.parse.urlencode(params)
+        url = f"{bars_path}?{query}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "APCA-API-KEY-ID": key_id,
+                "APCA-API-SECRET-KEY": secret,
+                "Accept": "application/json",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+            raise ValueError(f"Alpaca HTTP {exc.code}: {body[:500]}") from exc
+        except urllib.error.URLError as exc:
+            raise ValueError(f"Alpaca request failed: {exc}") from exc
+        sym_bars = (payload.get("bars") or {}).get(symbol) or []
+        for b in sym_bars:
+            collected.append(b)
+        next_token = payload.get("next_page_token")
+        if not next_token:
+            break
+    if not collected:
+        return pd.DataFrame()
+    df = pd.DataFrame(collected)
+    df = df.rename(
+        columns={
+            "t": "datetime",
+            "o": "open",
+            "h": "high",
+            "l": "low",
+            "c": "close",
+            "v": "volume",
+        }
+    )
+    return _normalize_ohlcv_frame(df)
+
+
 def _fetch_stooq(request: DataRequest) -> pd.DataFrame:
     if request.asset_class not in {"equity", "etf"}:
         raise ValueError("Stooq only supports equity and ETF routing in this project")
@@ -257,12 +376,19 @@ def fetch_ohlcv_from_provider(provider: str, request: DataRequest) -> pd.DataFra
         return _fetch_yahoo(request)
     if provider_norm == "stooq":
         return _fetch_stooq(request)
+    if provider_norm == "alpaca":
+        return _fetch_alpaca(request)
     raise ValueError(f"Unsupported provider: {provider_norm}")
 
 
 def resolve_provider_candidates(request: DataRequest) -> list[str]:
     timeframe = normalize_timeframe(request.timeframe)
     preferred = str(request.provider_preference or "auto").strip().lower()
+    if preferred == "alpaca":
+        asset = infer_asset_class(request.symbol, request.asset_class)
+        if asset == "crypto":
+            return ["yahoo"]
+        return ["alpaca", "yahoo"]
     if preferred and preferred != "auto":
         return [preferred]
     if request.asset_class == "crypto":

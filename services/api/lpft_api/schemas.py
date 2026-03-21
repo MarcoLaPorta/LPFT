@@ -85,6 +85,7 @@ class AssistantStreamRequest(BaseModel):
     current_spec: StrategySpec | None = None
     symbol: str = "AAPL"
     period: str = "5y"
+    # Hint for planning / prompts; after generation, backtest uses StrategySpec.universe.timeframe.
     timeframe: str = "1d"
 
 

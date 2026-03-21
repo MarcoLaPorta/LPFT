@@ -101,6 +101,15 @@ body {
   min-width: 0;
 }
 
+/* Prima visita: solo chat; con backtest attivo/completato in sessione: split come prima */
+.lpft-main-chat-full .lpft-col-left {
+  flex: 1 1 100%;
+  max-width: 100%;
+}
+.lpft-main-chat-full .lpft-col-right {
+  display: none;
+}
+
 .btn-primary {
   background: rgba(124, 58, 237, 0.85) !important;
   color: white !important;

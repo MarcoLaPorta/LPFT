@@ -106,17 +106,22 @@ class ExecutionParams(BaseModel):
     entry_timing: Literal["next_bar_open", "bar_close"] = "next_bar_open"
 
 
+HistoryPeriod = Literal["1m", "3m", "6m", "1y", "2y", "5y"]
+
+
 class DataRequirements(BaseModel):
     market_model: Literal["ohlcv", "bid_ask", "order_book", "options"] = "ohlcv"
     requires_intrabar: bool = False
     asset_class: Literal["auto", "equity", "etf", "crypto"] = "auto"
-    provider_preference: Literal["auto", "yahoo", "stooq"] = "auto"
+    provider_preference: Literal["auto", "yahoo", "stooq", "alpaca"] = "auto"
     quality_policy: Literal["strict_gate", "quality_labels", "best_effort"] = "best_effort"
     freshness_requirement: Literal["relaxed", "standard", "strict"] = "standard"
     coverage_requirement: Literal["relaxed", "standard", "strict"] = "standard"
     corporate_actions_required: bool = False
     market: str | None = None
     notes: str | None = None
+    # Storico OHLCV per il backtest (1m|3m|6m|1y|2y|5y). L’LLM dovrebbe valorizzarlo; se null → fallback client + warning in capability.
+    history_period: HistoryPeriod | None = None
 
 
 class Universe(BaseModel):
@@ -191,6 +196,19 @@ class StrategySpec(BaseModel):
             params = data["params"]
         if kind == "mean_reversion" and isinstance(params, dict):
             normalized_params = dict(params)
+            if "period" not in normalized_params:
+                for alias in (
+                    "lookback_period",
+                    "lookback",
+                    "window",
+                    "length",
+                    "z_period",
+                    "zscore_period",
+                    "rolling_period",
+                ):
+                    if alias in normalized_params:
+                        normalized_params["period"] = normalized_params.pop(alias)
+                        break
             if "entry_z" not in normalized_params:
                 for alias in ("z_entry", "zscore_entry", "entry_threshold"):
                     if alias in normalized_params:
@@ -201,6 +219,23 @@ class StrategySpec(BaseModel):
                     if alias in normalized_params:
                         normalized_params["exit_z"] = normalized_params.pop(alias)
                         break
+            # entry_z / exit_z sono magnitudini positive (il compilatore usa z <= -entry_z per il long).
+            if "entry_z" in normalized_params:
+                try:
+                    ez = float(normalized_params["entry_z"])
+                    if ez < 0:
+                        ez = abs(ez)
+                    normalized_params["entry_z"] = max(0.5, min(5.0, ez))
+                except (TypeError, ValueError):
+                    pass
+            if "exit_z" in normalized_params:
+                try:
+                    xz = float(normalized_params["exit_z"])
+                    if xz < 0:
+                        xz = abs(xz)
+                    normalized_params["exit_z"] = max(0.0, min(4.0, xz))
+                except (TypeError, ValueError):
+                    pass
             data = {**data, "params": normalized_params}
             params = data["params"]
         if isinstance(params, dict) and kind is not None:

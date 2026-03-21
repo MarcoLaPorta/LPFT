@@ -19,7 +19,7 @@ from lpft_api.schemas import AssistantMessage
 _client: Anthropic | None = None
 
 _PLANNER_PROMPT = """You are LPFT Copilot, a trading-focused AI assistant similar to Cursor for trading workflows.
-Decide the best next action for the latest user request.
+Your north star is helping the user obtain the strongest algorithm this stack can produce: coherent logic, realistic data assumptions, and parameters suited to their stated goal.
 
 Return ONLY one JSON object with this shape:
 {
@@ -37,15 +37,15 @@ Rules:
 - Use "generate" when the user is asking for a new strategy, new trading code, or explicitly wants a strategy built.
 - Use "modify" when the user wants to revise, improve, fix, or debug the current strategy/code.
 - Use "analyze" when the user is asking about current results, trades, drawdown, performance, or wants an explanation of the latest run.
-- Use "clarify" when the user is underspecified and there are multiple sensible directions. Prefer clarify instead of guessing when the choice affects the output meaningfully.
-- For generate/modify requests, do not leave major design choices to chance. If any of these are still materially unclear, prefer "clarify" before generating: market/universe, strategy style or edge, timeframe/holding horizon, direction or risk profile, and whether to backtest immediately.
-- Ask only one clarification at a time, and make it high leverage.
-- Keep assistant_reply concise, practical, natural, and professional. It should feel like a sharp product teammate, not a generic chatbot.
+- Use "clarify" whenever missing information would force weak or arbitrary choices for a high-quality strategy. Do NOT jump to generate/modify if critical knobs are unknown: ask first. The user stays in control, but you guide with expert defaults offered as explicit choices.
+- For mode "clarify": ask exactly ONE high-leverage question. clarification_options must be 2-4 concrete choices. Order them by recommendation: put the best option for the user's stated goal FIRST (you may prefix with "Consigliato:" or "Recommended:" in the same language as the user). Include at least one escape hatch (e.g. "Altro / specifico" / "Other — I'll specify").
+- For generate/modify: if instrument, universe/market, edge/style, horizon (bar + holding), risk posture, backtest history length, or run intent are unclear, prefer "clarify" over guessing. When the transcript is rich enough to proceed, use generate/modify with a strategy_prompt that locks those decisions.
+- When you do generate, the downstream model must output a complete StrategySpec; any residual inference must appear in data.notes so the user can override on the next turn.
+- Keep assistant_reply concise, practical, natural, and professional.
 - assistant_reply should match the user's language.
 - If mode is answer or analyze, strategy_prompt should be empty.
 - If mode is generate or modify, strategy_prompt must be a strong instruction that another model can turn into a valid structured trading strategy.
 - If mode is analyze, analysis_prompt must clearly state what to explain.
-- If mode is clarify, provide one short question plus 2-4 distinct multiple-choice options that help narrow direction quickly.
 - Set should_backtest to true only if the user clearly wants a generated/modified strategy tested and the request is specific enough to design responsibly.
 """
 
@@ -87,6 +87,8 @@ _TIMEFRAME_HINT_RE = re.compile(
     r"\b(?:1m|5m|15m|30m|1h|1d|intraday|day trading|scalp|scalping|swing|multiday|daily|giornalier[oa]?|weekly|position|long term|medium term|overnight)\b",
     re.IGNORECASE,
 )
+# Codici periodo storico backtest (allineati a lpft_shared.market_data.VALID_PERIODS)
+_BACKTEST_PERIOD_CODE_RE = re.compile(r"\b(1m|3m|6m|1y|2y|5y)\b", re.IGNORECASE)
 _RISK_HINT_RE = re.compile(
     r"\b(?:long only|long-only|long short|long-short|market neutral|conservative|conservativo|balanced|bilanciat\w*|aggressive|aggressiv\w*|drawdown|stop loss|stop-loss|take profit|trailing stop|risk|rischio|hedged?|leva)\b",
     re.IGNORECASE,
@@ -184,6 +186,7 @@ class RequirementSnapshot:
     risk: str | None = None
     execution: str | None = None
     backtest: str | None = None
+    backtest_window: str | None = None  # 1m|3m|6m|1y|2y|5y quando l'utente indica quanto storico per il backtest
     missing: list[str] | None = None
     ready_for_generation: bool = False
     user_approved: bool = False
@@ -321,6 +324,22 @@ def _collect_requirement_snapshot(
     elif re.search(r"\b(?:senza backtest|no backtest|solo codice|only code)\b", lowered):
         snapshot.backtest = "not requested"
 
+    pcm = _BACKTEST_PERIOD_CODE_RE.search(text)
+    if pcm:
+        snapshot.backtest_window = pcm.group(1).lower()
+    elif re.search(r"\b(?:cinque|5)\s*anni\b", lowered) or re.search(r"\b5\s*years?\b", lowered):
+        snapshot.backtest_window = "5y"
+    elif re.search(r"\b(?:due|2)\s*anni\b", lowered) or re.search(r"\b2\s*years?\b", lowered):
+        snapshot.backtest_window = "2y"
+    elif re.search(r"\b(?:un|1)\s*anno\b", lowered) or re.search(r"\b1\s*year\b", lowered):
+        snapshot.backtest_window = "1y"
+    elif re.search(r"\b(?:sei|6)\s*mesi\b", lowered):
+        snapshot.backtest_window = "6m"
+    elif re.search(r"\b(?:tre|3)\s*mesi\b", lowered):
+        snapshot.backtest_window = "3m"
+    elif re.search(r"\b(?:un|1)\s*mese\b", lowered):
+        snapshot.backtest_window = "1m"
+
     snapshot.user_approved = _has_explicit_generation_approval(text)
     snapshot.missing = []
     if snapshot.instrument is None:
@@ -333,8 +352,76 @@ def _collect_requirement_snapshot(
         snapshot.missing.append("timeframe")
     if snapshot.risk is None:
         snapshot.missing.append("risk")
-    snapshot.ready_for_generation = not snapshot.missing
+    snapshot.ready_for_generation = bool(
+        not snapshot.missing
+        and (snapshot.backtest != "requested" or snapshot.backtest_window is not None)
+    )
     return snapshot
+
+
+def _backtest_window_options(snapshot: RequirementSnapshot, *, italian: bool) -> list[str]:
+    """Opzioni consigliate per history_period: la prima è la scelta algoritmica migliore per il contesto."""
+    edge_l = (snapshot.edge or "").lower()
+    tf_l = (snapshot.timeframe or "").lower()
+    intraday = "intraday" in tf_l or "scalp" in tf_l
+    mean_rv = "reversion" in edge_l or "mean" in edge_l
+    trend = "trend" in edge_l or "momentum" in edge_l
+
+    if intraday:
+        if italian:
+            return [
+                "Consigliato: 1y (più barre intraday utili)",
+                "6m",
+                "3m",
+                "Altro — specifico io",
+            ]
+        return [
+            "Recommended: 1y (more intraday history)",
+            "6m",
+            "3m",
+            "Other — I'll specify",
+        ]
+    if mean_rv:
+        if italian:
+            return [
+                "Consigliato: 5y (sample più ricco per z-score su daily)",
+                "2y",
+                "1y",
+                "Altro — specifico io",
+            ]
+        return [
+            "Recommended: 5y (richer sample for daily z-scores)",
+            "2y",
+            "1y",
+            "Other — I'll specify",
+        ]
+    if trend:
+        if italian:
+            return [
+                "Consigliato: 5y (più cicli di mercato)",
+                "2y",
+                "1y",
+                "Altro — specifico io",
+            ]
+        return [
+            "Recommended: 5y (more market regimes)",
+            "2y",
+            "1y",
+            "Other — I'll specify",
+        ]
+    if italian:
+        return [
+            "Consigliato: 5y (default robusto LPFT)",
+            "2y",
+            "1y",
+            "Altro — specifico io",
+        ]
+    return [
+        "Recommended: 5y (robust LPFT default)",
+        "2y",
+        "1y",
+        "Other — I'll specify",
+    ]
 
 
 def _instrument_clarification_options(snapshot: RequirementSnapshot, *, italian: bool) -> list[str]:
@@ -419,9 +506,19 @@ def _requirements_clarification_plan(
                 else "Which universe should I design it for first?"
             ),
             clarification_options=(
-                ["Azioni USA liquide", "ETF liquidi", "Crypto major", "Un ticker specifico"]
+                [
+                    "Consigliato: azioni USA molto liquide (spread e dati migliori)",
+                    "ETF liquidi (es. broad market)",
+                    "Crypto major",
+                    "Un ticker specifico",
+                ]
                 if italian
-                else ["Liquid US equities", "Liquid ETFs", "Major crypto", "One specific ticker"]
+                else [
+                    "Recommended: very liquid US equities (tighter spreads, cleaner data)",
+                    "Liquid ETFs (e.g. broad market)",
+                    "Major crypto",
+                    "One specific ticker",
+                ]
             ),
             clarification_summary=summary,
             clarification_missing=missing_pretty,
@@ -431,20 +528,30 @@ def _requirements_clarification_plan(
         return AssistantPlan(
             mode="clarify",
             assistant_reply=(
-                "Perfetto. Adesso voglio bloccare il tipo di edge, cosi posso scegliere logica e parametri coerenti."
+                "Per massima qualità algoritmica serve fissare il tipo di edge: da lì dipendono parametri e validazione."
                 if italian
-                else "Good. Now I want to lock the edge first, so I can choose the right logic and parameters."
+                else "For the strongest algorithm we should lock the edge first—that drives parameters and validation."
             ),
             should_backtest=False,
             clarification_question=(
-                "Qual e il motore principale della strategia?"
+                "Qual è il motore principale della strategia?"
                 if italian
                 else "What should be the main engine of the strategy?"
             ),
             clarification_options=(
-                ["Trend o momentum", "Mean reversion", "Breakout", "Ibrida ma robusta"]
+                [
+                    "Consigliato: mean reversion su strumenti liquidi (spesso robusta in daily)",
+                    "Trend / momentum",
+                    "Breakout",
+                    "Ibrida conservativa (meno overfit)",
+                ]
                 if italian
-                else ["Trend or momentum", "Mean reversion", "Breakout", "Hybrid but robust"]
+                else [
+                    "Recommended: mean reversion on liquid names (often robust on daily)",
+                    "Trend / momentum",
+                    "Breakout",
+                    "Conservative hybrid (less overfit)",
+                ]
             ),
             clarification_summary=summary,
             clarification_missing=missing_pretty,
@@ -454,9 +561,9 @@ def _requirements_clarification_plan(
         return AssistantPlan(
             mode="clarify",
             assistant_reply=(
-                "Mi manca ancora l'orizzonte operativo, che cambia segnali, costi e gestione del rischio."
+                "L'orizzonte decide barra, costi e qualità dati: per algoritmi solidi conviene sceglierlo esplicitamente."
                 if italian
-                else "I still need the trading horizon, because it changes signals, costs, and risk management."
+                else "Horizon drives bar size, costs, and data quality—worth choosing explicitly for a solid algorithm."
             ),
             should_backtest=False,
             clarification_question=(
@@ -465,9 +572,19 @@ def _requirements_clarification_plan(
                 else "What holding horizon do you want to target?"
             ),
             clarification_options=(
-                ["Intraday", "Swing di pochi giorni", "Position di alcune settimane", "Daily robusto senza intraday"]
+                [
+                    "Consigliato: daily / position (dati free più stabili, meno buchi)",
+                    "Swing (pochi giorni)",
+                    "Intraday (più rumore, serve contesto chiaro)",
+                    "Altro — specifico io",
+                ]
                 if italian
-                else ["Intraday", "Swing over a few days", "Position over a few weeks", "Robust daily without intraday"]
+                else [
+                    "Recommended: daily / position (freest data more stable, fewer gaps)",
+                    "Swing (few days)",
+                    "Intraday (noisier—needs clear intent)",
+                    "Other — I'll specify",
+                ]
             ),
             clarification_summary=summary,
             clarification_missing=missing_pretty,
@@ -477,9 +594,9 @@ def _requirements_clarification_plan(
         return AssistantPlan(
             mode="clarify",
             assistant_reply=(
-                "Ultimo punto: voglio fissare il profilo di rischio prima di generare parametri e codice."
+                "Il profilo di rischio vincola sizing e drawdown: meglio definirlo prima di generare codice."
                 if italian
-                else "Last point: I want to lock the risk profile before I generate parameters and code."
+                else "Risk profile caps sizing and drawdown—better to define it before code generation."
             ),
             should_backtest=False,
             clarification_question=(
@@ -488,12 +605,44 @@ def _requirements_clarification_plan(
                 else "What risk profile do you want?"
             ),
             clarification_options=(
-                ["Conservativo", "Bilanciato", "Aggressivo", "Long short se serve"]
+                [
+                    "Consigliato: bilanciato (buon default per partire)",
+                    "Conservativo",
+                    "Aggressivo",
+                    "Long/short solo se serve",
+                ]
                 if italian
-                else ["Conservative", "Balanced", "Aggressive", "Long short if useful"]
+                else [
+                    "Recommended: balanced (strong default to start)",
+                    "Conservative",
+                    "Aggressive",
+                    "Long/short only if needed",
+                ]
             ),
             clarification_summary=summary,
             clarification_missing=missing_pretty,
+        )
+
+    if snapshot.backtest == "requested" and snapshot.backtest_window is None:
+        return AssistantPlan(
+            mode="clarify",
+            assistant_reply=(
+                "Per un backtest affidabile serve quantificare lo storico: più anni → statistiche migliori ma più dati."
+                if italian
+                else "For a credible backtest we need a history length: more years → better statistics but more data load."
+            ),
+            should_backtest=False,
+            clarification_question=(
+                "Quanto storico vuoi usare per il backtest?"
+                if italian
+                else "How much history should the backtest use?"
+            ),
+            clarification_options=_backtest_window_options(snapshot, italian=italian),
+            clarification_summary=summary,
+            clarification_missing=missing_pretty
+            + [
+                ("finestra storica backtest" if italian else "backtest history window"),
+            ],
         )
 
     if not snapshot.user_approved:
@@ -747,13 +896,19 @@ def build_strategy_prompt(
         [
             "",
             "Return a valid trading strategy spec that best satisfies the request. Use practical defaults, realistic risk, and include universe.",
+            "The model must emit a complete StrategySpec: every required param for the chosen kind, full risk and execution, universe.symbols and universe.timeframe, and data fields for OHLCV (including data.history_period 1m|3m|6m|1y|2y|5y). Nothing critical should be left implicit for the server to guess.",
+            "Set universe.timeframe to the bar interval the strategy uses (1m|5m|15m|30m|1h|1d); it drives OHLCV bar size in the backtest.",
+            "Set data.history_period to the backtest lookback window. If the user did not specify, pick the best default for the strategy style and document it in data.notes so they can change it.",
+            "When you infer defaults (thresholds, horizons, provider, risk caps), list each assumption briefly in data.notes. The user must stay in control: transparent, adjustable choices, not opaque shortcuts.",
+            "If the user just picked a multiple-choice option from clarification (e.g. recommended horizon or history window), treat it as binding and reflect it in universe, data.history_period, risk, and params.",
+            "Align universe.timeframe with user intent (intraday vs swing vs daily). If ambiguous, choose a conventional default and note it.",
             "Use only the confirmed user requirements and current strategy context. Do not silently invent major design decisions when the conversation already constrained them.",
             "Prefer supported built-in strategy kinds when possible.",
             "If you choose kind=python, the code must stay compatible with the shared backtest runtime: pandas only, no external libraries beyond pandas/numpy compatibility, and only OHLCV columns.",
             "If you choose kind=python, prefer readable target-position logic, initialize numeric series with 0.0, avoid lookahead bias, and keep the implementation production-grade for the available information.",
             "Use execution.position_mode=long_short only when the user clearly wants short exposure.",
             "Set data.asset_class explicitly when the user is talking about equities, ETFs, or crypto.",
-            "Use data.provider_preference='auto' unless the user clearly asks for a specific free provider.",
+            "Use data.provider_preference='auto' (Yahoo-first backtests) unless the user asks for a specific provider (yahoo, stooq, or alpaca with API keys configured).",
             "Default to data.quality_policy='best_effort' for free providers unless the user explicitly asks for stricter gating.",
             "For equities and ETFs, set data.corporate_actions_required=true unless the request clearly does not care about adjusted data.",
             "If one non-critical assumption still has to be inferred, choose the most conservative tradable assumption and record it in data.notes.",

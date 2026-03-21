@@ -71,13 +71,15 @@ export interface StrategySpec {
     market_model?: "ohlcv" | "bid_ask" | "order_book" | "options";
     requires_intrabar?: boolean;
     asset_class?: "auto" | "equity" | "etf" | "crypto";
-    provider_preference?: "auto" | "yahoo" | "stooq";
+    provider_preference?: "auto" | "yahoo" | "stooq" | "alpaca";
     quality_policy?: "strict_gate" | "quality_labels" | "best_effort";
     freshness_requirement?: "relaxed" | "standard" | "strict";
     coverage_requirement?: "relaxed" | "standard" | "strict";
     corporate_actions_required?: boolean;
     market?: string | null;
     notes?: string | null;
+    /** Storico OHLCV per backtest (1m|3m|6m|1y|2y|5y); se assente usa il default client. */
+    history_period?: "1m" | "3m" | "6m" | "1y" | "2y" | "5y" | null;
   };
 }
 
@@ -476,7 +478,7 @@ export const api = {
       interval?: string,
       options?: {
         asset_class?: "auto" | "equity" | "etf" | "crypto";
-        provider_preference?: "auto" | "yahoo" | "stooq";
+        provider_preference?: "auto" | "yahoo" | "stooq" | "alpaca";
         quality_policy?: "strict_gate" | "quality_labels" | "best_effort";
       }
     ) => {

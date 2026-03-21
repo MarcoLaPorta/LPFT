@@ -16,12 +16,20 @@ from lpft_api.assistant import build_strategy_prompt, plan_assistant_turn, strea
 from lpft_api.capabilities import CapabilityStatus, assess_strategy_spec
 from lpft_api.config import settings
 from lpft_api.db import Run, RunStatus, RunType, Strategy, engine, init_db
+from lpft_api.dsl import StrategySpec
 from lpft_api.llm import generate_strategy_spec, generate_strategy_spec_stream
 from lpft_api.inline_backtest import run_generate_signals, run_inline_backtest
 from lpft_api.program_llm import generate_program, repair_program
 from lpft_api.queue import get_queue
 from lpft_shared.engine import build_validation_ohlcv, extract_program_metadata, write_validation_artifact
-from lpft_shared.market_data import DataQualityError, DataRequest, canonicalize_symbol, load_market_data_bundle, load_market_data_snapshot
+from lpft_shared.market_data import (
+    DataQualityError,
+    DataRequest,
+    canonicalize_symbol,
+    load_market_data_bundle,
+    load_market_data_snapshot,
+    normalize_period,
+)
 from lpft_api.schemas import (
     AssistantStreamRequest,
     DatasetFetchResponse,
@@ -245,6 +253,26 @@ def _check_anthropic_key():
             status_code=503,
             detail="ANTHROPIC_API_KEY non configurata. Imposta la variabile d'ambiente LPFT_ANTHROPIC_API_KEY e riavvia l'API.",
         )
+
+
+def _timeframe_from_spec(spec: StrategySpec, fallback: str = "1d") -> str:
+    """Bar interval for OHLCV load: always taken from the strategy spec once generated."""
+    tf = spec.universe.timeframe
+    raw = getattr(tf, "value", str(tf)) if tf is not None else ""
+    cleaned = str(raw or "").strip()
+    return cleaned if cleaned else (fallback or "1d")
+
+
+def _period_from_spec(spec: StrategySpec, fallback: str = "1y") -> str:
+    """Lookback storico per OHLCV (1m…5y): da data.history_period se valorizzato, altrimenti fallback (es. richiesta client)."""
+    hp = spec.data.history_period
+    if hp is None:
+        return fallback or "1y"
+    raw = getattr(hp, "value", str(hp))
+    try:
+        return normalize_period(str(raw))
+    except ValueError:
+        return fallback or "1y"
 
 
 def _generate_valid_program(strategy_spec, *, symbol: str, timeframe: str) -> tuple[str, dict]:
@@ -507,10 +535,12 @@ def _stream_assistant(body: AssistantStreamRequest):
             yield f"data: {_json.dumps({'type': 'done'})}\n\n"
             return
 
+        backtest_timeframe = _timeframe_from_spec(spec, body.timeframe or "1d")
+        backtest_period = _period_from_spec(spec, body.period or "1y")
         code, validation = _generate_valid_program(
             spec,
             symbol=body.symbol or "AAPL",
-            timeframe=body.timeframe or "1d",
+            timeframe=backtest_timeframe,
         )
         validation["warnings"] = list(dict.fromkeys([*capability.warnings, *validation.get("warnings", [])]))
         if plan.should_backtest:
@@ -518,8 +548,8 @@ def _stream_assistant(body: AssistantStreamRequest):
                 data_validation = _preflight_market_data(
                     code,
                     symbol=body.symbol or "AAPL",
-                    period=body.period or "1y",
-                    timeframe=body.timeframe or "1d",
+                    period=backtest_period,
+                    timeframe=backtest_timeframe,
                 )
             except DataQualityError as exc:
                 yield f"data: {_json.dumps({'type': 'validation', 'validation': {'status': 'invalid', 'summary': exc.report.get('summary', 'Market data quality rejected'), 'warnings': exc.report.get('warnings', []), 'data_sources': exc.report.get('symbol_errors', []) or [exc.report]}})}\n\n"
@@ -537,18 +567,18 @@ def _stream_assistant(body: AssistantStreamRequest):
             run_id = _create_program_run(
                 program_code=code,
                 symbol=body.symbol or "AAPL",
-                period=body.period or "1y",
-                timeframe=body.timeframe or "1d",
+                period=backtest_period,
+                timeframe=backtest_timeframe,
             )
             _enqueue_backtest_with_fallback(
                 run_id,
                 symbol=body.symbol or "AAPL",
-                period=body.period or "1y",
-                timeframe=body.timeframe or "1d",
+                period=backtest_period,
+                timeframe=backtest_timeframe,
                 program_code=code,
             )
             yield f"data: {_json.dumps({'type': 'run_status', 'run_id': run_id, 'status': 'pending'})}\n\n"
-            yield f"data: {_json.dumps({'type': 'run', 'run_id': run_id, 'code': code, 'spec': spec.model_dump(), 'params': {'symbol': body.symbol or 'AAPL', 'period': body.period or '1y', 'timeframe': body.timeframe or '1d'}})}\n\n"
+            yield f"data: {_json.dumps({'type': 'run', 'run_id': run_id, 'code': code, 'spec': spec.model_dump(), 'params': {'symbol': body.symbol or 'AAPL', 'period': backtest_period, 'timeframe': backtest_timeframe}})}\n\n"
 
         yield f"data: {_json.dumps({'type': 'done'})}\n\n"
     except Exception as e:
@@ -614,28 +644,30 @@ def api_generate_and_backtest(request: Request, body: GenerateAndBacktestRequest
             CapabilityStatus.unsupported_with_conversion_path,
         }:
             raise HTTPException(status_code=400, detail=capability.summary)
+        backtest_timeframe = _timeframe_from_spec(body.strategy_spec, body.timeframe or "1d")
+        backtest_period = _period_from_spec(body.strategy_spec, body.period or "1y")
         code, _validation = _generate_valid_program(
             body.strategy_spec,
             symbol=body.symbol or "AAPL",
-            timeframe=body.timeframe or "1d",
+            timeframe=backtest_timeframe,
         )
         _preflight_market_data(
             code,
             symbol=body.symbol or "AAPL",
-            period=body.period or "1y",
-            timeframe=body.timeframe or "1d",
+            period=backtest_period,
+            timeframe=backtest_timeframe,
         )
         run_id = _create_program_run(
             program_code=code,
             symbol=body.symbol,
-            period=body.period,
-            timeframe=body.timeframe,
+            period=backtest_period,
+            timeframe=backtest_timeframe,
         )
         _enqueue_backtest_with_fallback(
             run_id,
             symbol=body.symbol or "AAPL",
-            period=body.period or "1y",
-            timeframe=body.timeframe or "1d",
+            period=backtest_period,
+            timeframe=backtest_timeframe,
             program_code=code,
         )
         return GenerateAndBacktestResponse(run_id=run_id, program_code=code)

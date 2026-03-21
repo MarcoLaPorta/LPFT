@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import sys
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 for extra in (ROOT / "worker", ROOT / "shared"):
@@ -18,6 +20,7 @@ from lpft_api.capabilities import CapabilityStatus, assess_strategy_spec
 from lpft_api.assistant import _collect_requirement_snapshot, _requirements_clarification_plan
 from lpft_api.schemas import AssistantMessage
 from lpft_api.dsl import DataRequirements, StrategySpec
+from lpft_api.main import _period_from_spec
 from lpft_api.inline_backtest import run_generate_signals as api_run_generate_signals
 from lpft_api.program_llm import generate_program
 from lpft_shared.engine import (
@@ -31,8 +34,10 @@ from lpft_shared.market_data import (
     DataRequest,
     MarketDataSnapshot,
     build_cache_key,
+    fetch_ohlcv_from_provider,
     load_market_data_bundle,
     load_market_data_snapshot,
+    resolve_provider_candidates,
     validate_market_data,
 )
 from lpft_worker.programs import run_generate_signals as worker_run_generate_signals
@@ -115,6 +120,39 @@ class StrategyEngineTests(unittest.TestCase):
     def test_data_requirements_default_to_best_effort(self) -> None:
         requirements = DataRequirements()
         self.assertEqual(requirements.quality_policy, "best_effort")
+
+    def test_mean_reversion_params_accept_lookback_period_alias(self) -> None:
+        spec = StrategySpec.model_validate(
+            {
+                "kind": "mean_reversion",
+                "params": {"lookback_period": 20, "entry_z": 2.0, "exit_z": 0.5},
+            }
+        )
+        self.assertEqual(spec.kind.value, "mean_reversion")
+        self.assertEqual(spec.params.period, 20)
+        self.assertEqual(spec.params.entry_z, 2.0)
+        self.assertEqual(spec.params.exit_z, 0.5)
+
+    def test_mean_reversion_coerces_negative_z_thresholds(self) -> None:
+        spec = StrategySpec.model_validate(
+            {
+                "kind": "mean_reversion",
+                "params": {"period": 20, "entry_z": -1.5, "exit_z": -0.25},
+            }
+        )
+        self.assertEqual(spec.params.entry_z, 1.5)
+        self.assertEqual(spec.params.exit_z, 0.25)
+
+    def test_period_from_spec_prefers_data_history_period(self) -> None:
+        spec = StrategySpec.model_validate(
+            {
+                "kind": "sma_crossover",
+                "params": {"fast": 5, "slow": 20, "price": "close"},
+                "data": {"history_period": "5y"},
+            }
+        )
+        self.assertEqual(_period_from_spec(spec, "1y"), "5y")
+        self.assertEqual(_period_from_spec(spec, "1m"), "5y")
 
     def test_api_and_worker_wrappers_match(self) -> None:
         code = """# LPFT-META: {"artifact_type":"python","capability_status":"supported","capability_summary":"ok","engine_version":"lpft-engine-v2","fee_bps":0.0,"max_gross_exposure":1.0,"max_position_pct":1.0,"position_mode":"long_only","rebalance_mode":"equal_weight","signal_semantics":"target_position","slippage_bps":0.0,"strategy_kind":"python","symbols":["AAPL"],"timeframe":"1d","warnings":[]}
@@ -260,6 +298,87 @@ def generate_positions(ohlcv: pd.DataFrame) -> pd.Series:
         self.assertEqual(calls[:2], ["yahoo", "stooq"])
         self.assertEqual(snapshot.provider_used, "stooq")
 
+    def test_resolve_provider_candidates_alpaca_then_yahoo_for_equity(self) -> None:
+        cands = resolve_provider_candidates(
+            DataRequest(
+                symbol="AAPL",
+                period="1y",
+                timeframe="1d",
+                asset_class="equity",
+                provider_preference="alpaca",
+            )
+        )
+        self.assertEqual(cands, ["alpaca", "yahoo"])
+
+    def test_resolve_provider_candidates_alpaca_crypto_uses_yahoo_only(self) -> None:
+        cands = resolve_provider_candidates(
+            DataRequest(
+                symbol="BTC-USD",
+                period="1y",
+                timeframe="1d",
+                asset_class="crypto",
+                provider_preference="alpaca",
+            )
+        )
+        self.assertEqual(cands, ["yahoo"])
+
+    def test_provider_routing_alpaca_fails_over_to_yahoo(self) -> None:
+        calls: list[str] = []
+
+        def fake_fetch(provider: str, request: DataRequest) -> pd.DataFrame:
+            calls.append(provider)
+            if provider == "alpaca":
+                raise ValueError("Alpaca market data requires LPFT_ALPACA_API_KEY and LPFT_ALPACA_SECRET_KEY")
+            return _sample_market()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("lpft_shared.market_data.fetch_ohlcv_from_provider", side_effect=fake_fetch):
+                snapshot = load_market_data_snapshot(
+                    DataRequest(
+                        symbol="AAPL",
+                        period="1y",
+                        timeframe="1d",
+                        asset_class="equity",
+                        provider_preference="alpaca",
+                        quality_policy="best_effort",
+                        freshness_requirement="relaxed",
+                        coverage_requirement="relaxed",
+                    ),
+                    Path(tmpdir),
+                )
+        self.assertEqual(calls[:2], ["alpaca", "yahoo"])
+        self.assertEqual(snapshot.provider_used, "yahoo")
+
+    def test_fetch_alpaca_parses_bars(self) -> None:
+        payload = {
+            "bars": {
+                "AAPL": [
+                    {"t": "2024-01-02T05:00:00Z", "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.5, "v": 1000.0}
+                ]
+            },
+            "next_page_token": None,
+        }
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
+        mock_cm = MagicMock()
+        mock_cm.__enter__.return_value = mock_resp
+        mock_cm.__exit__.return_value = False
+        with patch.dict(os.environ, {"LPFT_ALPACA_API_KEY": "k", "LPFT_ALPACA_SECRET_KEY": "s"}):
+            with patch("lpft_shared.market_data.urllib.request.urlopen", return_value=mock_cm):
+                df = fetch_ohlcv_from_provider(
+                    "alpaca",
+                    DataRequest(
+                        symbol="AAPL",
+                        period="1y",
+                        timeframe="1d",
+                        asset_class="equity",
+                        provider_preference="alpaca",
+                    ),
+                )
+        self.assertFalse(df.empty)
+        self.assertIn("close", df.columns)
+        self.assertAlmostEqual(float(df["close"].iloc[-1]), 100.5)
+
     def test_bundle_quality_gate_blocks_when_one_symbol_fails(self) -> None:
         def fake_snapshot(request: DataRequest, storage_dir: Path):
             if request.symbol == "BROKEN":
@@ -328,7 +447,7 @@ def generate_positions(ohlcv: pd.DataFrame) -> pd.Series:
             [
                 AssistantMessage(
                     role="user",
-                    content="Voglio una strategia trend su AAPL per azioni USA, daily, profilo bilanciato. Procedi con la generazione."
+                    content="Voglio una strategia trend su AAPL per azioni USA, daily, profilo bilanciato, backtest su 5y. Procedi con la generazione."
                 )
             ],
             current_spec=None,
@@ -340,6 +459,7 @@ def generate_positions(ohlcv: pd.DataFrame) -> pd.Series:
         self.assertEqual(snapshot.risk, "balanced")
         self.assertTrue(snapshot.ready_for_generation)
         self.assertTrue(snapshot.user_approved)
+        self.assertEqual(snapshot.backtest_window, "5y")
 
     def test_requirement_clarification_plan_requests_instrument_first(self) -> None:
         messages = [
@@ -365,7 +485,7 @@ def generate_positions(ohlcv: pd.DataFrame) -> pd.Series:
         messages = [
             AssistantMessage(
                 role="user",
-                content="Crea una strategia trend su SPY per ETF, daily, rischio bilanciato"
+                content="Crea una strategia trend su SPY per ETF, daily, rischio bilanciato, backtest su 5 anni"
             )
         ]
         plan = _requirements_clarification_plan(
@@ -380,6 +500,28 @@ def generate_positions(ohlcv: pd.DataFrame) -> pd.Series:
         self.assertEqual(plan.mode, "clarify")
         self.assertTrue(plan.clarification_summary)
         self.assertIn("Procedi con la generazione", plan.clarification_options or [])
+
+    def test_requirement_clarification_plan_requests_backtest_window_when_needed(self) -> None:
+        messages = [
+            AssistantMessage(
+                role="user",
+                content="Strategia mean reversion su MSFT azioni USA daily rischio bilanciato, esegui backtest",
+            )
+        ]
+        plan = _requirements_clarification_plan(
+            mode="generate",
+            messages=messages,
+            latest_user=messages[-1].content,
+            current_code=None,
+            current_spec=None,
+        )
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.mode, "clarify")
+        q = (plan.clarification_question or "").lower()
+        self.assertTrue("storico" in q or "history" in q)
+        opts = plan.clarification_options or []
+        self.assertTrue(any("5y" in o or "Recommended" in o or "Consigliato" in o for o in opts))
 
 
 if __name__ == "__main__":

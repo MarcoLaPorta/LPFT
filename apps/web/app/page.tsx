@@ -18,6 +18,52 @@ const DEFAULT_TIMEFRAME = "1d";
 const DEFAULT_VIEW_RANGE = "1y";
 const BACKTEST_DATA_PERIOD = "5y";
 
+/** Token che non sono ticker (allineato alla logica server assistant). */
+const TICKER_BLACKLIST = new Set(
+  "RSI EMA SMA MACD OHLCV ETF ETFS USA USD SP500 THE AND FOR NASDAQ".split(/\s+/)
+);
+
+/** Estrae un ticker dall’ultimo testo utente (es. MSFT, BTC-USD). */
+function extractTickerFromText(text: string): string | undefined {
+  const trimmed = text?.trim();
+  if (!trimmed) return undefined;
+  const re = /\$?([A-Z]{2,6}(?:-[A-Z]{3,4})?)\b/gi;
+  const found: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(trimmed)) !== null) {
+    const sym = m[1].toUpperCase();
+    if (!TICKER_BLACKLIST.has(sym)) found.push(sym);
+  }
+  if (found.length > 0) return found[found.length - 1];
+  const low = trimmed.toLowerCase();
+  if (/\bbitcoin\b|\bbtc\b/i.test(low)) return "BTC-USD";
+  if (/\bethereum\b|\beth\b/i.test(low)) return "ETH-USD";
+  return undefined;
+}
+
+/**
+ * Simbolo da inviare all’API: priorità = messaggio corrente → spec strategia → params ultimo run → default.
+ * Così cambiando ticker in chat i Results non restano bloccati su AAPL.
+ */
+function resolveAssistantStreamSymbol(
+  latestUserPrompt: string,
+  historyMessages: ChatMessage[],
+  currentContext:
+    | Extract<ChatMessage, { role: "assistant" }>
+    | undefined
+): string {
+  const fromPrompt = extractTickerFromText(latestUserPrompt);
+  if (fromPrompt) return fromPrompt;
+  const recentUsers = historyMessages.filter((m) => m.role === "user").slice(-3);
+  for (let i = recentUsers.length - 1; i >= 0; i--) {
+    const t = extractTickerFromText(recentUsers[i].content);
+    if (t) return t;
+  }
+  const specSym = currentContext?.spec?.universe?.symbols?.[0];
+  if (specSym) return specSym;
+  return currentContext?.params?.symbol ?? DEFAULT_SYMBOL;
+}
+
 /** Estrae la frase corrente dal ragionamento (ultima frase o testo in corso). */
 function currentReasoningPhrase(reasoning: string): string {
   const normalized = reasoning
@@ -145,11 +191,11 @@ function renderAssistantText(text: string) {
 }
 
 function formatRunStatus(status: "idle" | "pending" | "running" | "completed" | "failed" | undefined) {
-  if (status === "completed") return "Backtest complete";
-  if (status === "failed") return "Backtest failed";
-  if (status === "pending") return "Queued for backtest";
-  if (status === "running") return "Running backtest";
-  return "Backtest ready";
+  if (status === "completed") return "Backtest completato";
+  if (status === "failed") return "Backtest non riuscito";
+  if (status === "pending") return "In coda per il backtest";
+  if (status === "running") return "Backtest in esecuzione";
+  return "Pronto per il backtest";
 }
 
 function renderDataSources(
@@ -420,6 +466,15 @@ function TradesTable({
 }
 
 export default function HomePage() {
+  /** false = chat a schermo intero; true = colonna backtest visibile (dopo avvio run in sessione). */
+  const [splitLayout, setSplitLayout] = useState(false);
+
+  useEffect(() => {
+    const onBacktestRun = () => setSplitLayout(true);
+    window.addEventListener("lpft-backtest-run", onBacktestRun as EventListener);
+    return () => window.removeEventListener("lpft-backtest-run", onBacktestRun as EventListener);
+  }, []);
+
   return (
     <div className="h-screen overflow-hidden flex flex-col bg-[var(--bg-primary)]">
       <header className="shrink-0 h-12 flex items-center px-6 border-b border-[var(--border-subtle)]">
@@ -433,9 +488,14 @@ export default function HomePage() {
         </div>
       </header>
 
-      <main className="lpft-main flex-1 min-h-0 overflow-hidden">
+      <main
+        className={[
+          "lpft-main flex-1 min-h-0 overflow-hidden",
+          splitLayout ? "" : "lpft-main-chat-full",
+        ].join(" ")}
+      >
         <div className="lpft-card lpft-col-left">
-          <ChatColumn />
+          <ChatColumn splitLayout={splitLayout} />
         </div>
         <div className="lpft-card lpft-col-right">
           <BacktestColumn />
@@ -469,7 +529,7 @@ type ChatMessage =
       } | null;
     };
 
-function ChatColumn() {
+function ChatColumn({ splitLayout }: { splitLayout: boolean }) {
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(false);
@@ -543,6 +603,8 @@ function ChatColumn() {
         unsupported: null,
       },
     ]);
+    const streamSymbol = resolveAssistantStreamSymbol(basePrompt.trim(), messages, currentContext);
+
     try {
       await api.assistant.stream(
         {
@@ -550,9 +612,15 @@ function ChatColumn() {
           current_run_id: currentContext?.runId ?? null,
           current_code: currentContext?.code ?? null,
           current_spec: currentContext?.spec ?? null,
-          symbol: currentContext?.params?.symbol ?? DEFAULT_SYMBOL,
-          period: currentContext?.params?.period ?? BACKTEST_DATA_PERIOD,
-          timeframe: currentContext?.params?.timeframe ?? DEFAULT_TIMEFRAME,
+          symbol: streamSymbol,
+          period:
+            currentContext?.params?.period ??
+            currentContext?.spec?.data?.history_period ??
+            BACKTEST_DATA_PERIOD,
+          timeframe:
+            currentContext?.params?.timeframe ??
+            currentContext?.spec?.universe?.timeframe ??
+            DEFAULT_TIMEFRAME,
         },
         {
         onAssistantChunk(chunk) {
@@ -841,7 +909,12 @@ function ChatColumn() {
         onScroll={handleChatScroll}
         className="flex-1 overflow-y-auto scrollbar-thin"
       >
-        <div className="mx-auto max-w-2xl px-4 py-6 space-y-8">
+        <div
+          className={[
+            "mx-auto px-4 py-6 space-y-8",
+            splitLayout ? "max-w-2xl" : "max-w-3xl w-full",
+          ].join(" ")}
+        >
           {messages.length === 0 && (
             <div className="flex flex-col items-center justify-center min-h-[240px] text-center px-4">
               <p className="text-[14px] text-[var(--text-secondary)]">
@@ -1065,7 +1138,12 @@ function ChatColumn() {
       </div>
 
       <div className="shrink-0 px-4 py-3">
-        <div className="mx-auto max-w-2xl flex flex-col gap-2.5">
+        <div
+          className={[
+            "mx-auto flex flex-col gap-2.5",
+            splitLayout ? "max-w-2xl" : "max-w-3xl w-full",
+          ].join(" ")}
+        >
           {attachments.length > 0 && (
             <div className="flex flex-wrap gap-2">
               {attachments.map((a) => (
@@ -1477,56 +1555,6 @@ function BacktestColumn() {
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4 scrollbar-thin">
-        {runValidation && (
-          <div className="rounded-[20px] border border-[var(--border-subtle)] bg-[rgba(255,255,255,0.025)] px-4 py-3.5">
-            <p className="text-[11px] uppercase tracking-wider text-[var(--text-tertiary)] mb-1.5">
-              Validation
-            </p>
-            <p className="text-[13px] text-[var(--text-secondary)] leading-relaxed">
-              {runValidation.capability_summary ?? "Shared engine validation available."}
-            </p>
-            {runValidation.strategy_kind && (
-              <p className="mt-2 text-[12px] text-[var(--text-tertiary)]">
-                Kind: {runValidation.strategy_kind}
-                {runValidation.symbols_used && runValidation.symbols_used.length > 0
-                  ? ` · Symbols: ${runValidation.symbols_used.join(", ")}`
-                  : ""}
-              </p>
-            )}
-            {runValidation.data_policy && (
-              <p className="mt-2 text-[12px] text-[var(--text-tertiary)]">
-                {`Asset: ${runValidation.data_policy.asset_class ?? "auto"} · Provider: ${runValidation.data_policy.provider_preference ?? "auto"} · Policy: ${runValidation.data_policy.quality_policy ?? "best_effort"}`}
-              </p>
-            )}
-            {renderDataSources(runValidation.data_sources)}
-            {runValidation.data_error?.summary && (
-              <p className="mt-2 text-[12px] text-[var(--danger)] leading-relaxed">
-                {runValidation.data_error.summary}
-              </p>
-            )}
-            {runValidation.data_error?.symbol_errors &&
-              renderDataSources(
-                runValidation.data_error.symbol_errors.map((item) => ({
-                  canonical_symbol: item.canonical_symbol,
-                  requested_symbol: item.requested_symbol,
-                  provider_used: item.provider_used,
-                  freshness_status: item.freshness_status,
-                  coverage_status: item.coverage_status,
-                  status: item.status,
-                  warnings: item.warnings,
-                }))
-              )}
-            {runValidation.warnings && runValidation.warnings.length > 0 && (
-              <div className="mt-2 space-y-1">
-                {runValidation.warnings.map((warning, index) => (
-                  <p key={`${warning}-${index}`} className="text-[12px] text-[var(--text-tertiary)] leading-relaxed">
-                    {warning}
-                  </p>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
         {tab === "backtest" && (
           <>
             <div className="flex items-center justify-between">
@@ -1689,6 +1717,56 @@ function BacktestColumn() {
           <div className="rounded-lg border border-[var(--accent)]/30 bg-[var(--accent-muted)] px-3.5 py-2.5 text-[12px] text-[var(--accent)] flex items-center gap-2">
             <span className="w-1.5 h-1.5 rounded-full bg-[var(--text-secondary)] animate-pulse" />
             In esecuzione…
+          </div>
+        )}
+        {runValidation && (
+          <div className="rounded-[20px] border border-[var(--border-subtle)] bg-[rgba(255,255,255,0.025)] px-4 py-3.5">
+            <p className="text-[11px] uppercase tracking-wider text-[var(--text-tertiary)] mb-1.5">
+              Validation
+            </p>
+            <p className="text-[13px] text-[var(--text-secondary)] leading-relaxed">
+              {runValidation.capability_summary ?? "Shared engine validation available."}
+            </p>
+            {runValidation.strategy_kind && (
+              <p className="mt-2 text-[12px] text-[var(--text-tertiary)]">
+                Kind: {runValidation.strategy_kind}
+                {runValidation.symbols_used && runValidation.symbols_used.length > 0
+                  ? ` · Symbols: ${runValidation.symbols_used.join(", ")}`
+                  : ""}
+              </p>
+            )}
+            {runValidation.data_policy && (
+              <p className="mt-2 text-[12px] text-[var(--text-tertiary)]">
+                {`Asset: ${runValidation.data_policy.asset_class ?? "auto"} · Provider: ${runValidation.data_policy.provider_preference ?? "auto"} · Policy: ${runValidation.data_policy.quality_policy ?? "best_effort"}`}
+              </p>
+            )}
+            {renderDataSources(runValidation.data_sources)}
+            {runValidation.data_error?.summary && (
+              <p className="mt-2 text-[12px] text-[var(--danger)] leading-relaxed">
+                {runValidation.data_error.summary}
+              </p>
+            )}
+            {runValidation.data_error?.symbol_errors &&
+              renderDataSources(
+                runValidation.data_error.symbol_errors.map((item) => ({
+                  canonical_symbol: item.canonical_symbol,
+                  requested_symbol: item.requested_symbol,
+                  provider_used: item.provider_used,
+                  freshness_status: item.freshness_status,
+                  coverage_status: item.coverage_status,
+                  status: item.status,
+                  warnings: item.warnings,
+                }))
+              )}
+            {runValidation.warnings && runValidation.warnings.length > 0 && (
+              <div className="mt-2 space-y-1">
+                {runValidation.warnings.map((warning, index) => (
+                  <p key={`${warning}-${index}`} className="text-[12px] text-[var(--text-tertiary)] leading-relaxed">
+                    {warning}
+                  </p>
+                ))}
+              </div>
+            )}
           </div>
         )}
         {artifacts.length > 0 && (
