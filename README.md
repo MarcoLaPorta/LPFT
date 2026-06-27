@@ -1,9 +1,9 @@
-# LPFT · Agentic Finance Exchange (AFX)
+# LPFT · Agentic DeFi Layer
 
 > **Repository pubblico a scopo dimostrativo.**  
 > Il codice illustra l’architettura del prodotto; non include istruzioni di deploy, configurazione operativa né materiali per l’esecuzione in locale o su testnet.
 
-**Agentic Finance Exchange** è un exchange quantitativo non-custodial: l’utente dialoga con un agente fiduciario (Claude), ottiene backtest e report istituzionali, e — dopo conferma esplicita — può eseguire strategie on-chain tramite uno **SmartVault** personale.
+**Agentic DeFi Layer** è un exchange quantitativo non-custodial: l’utente dialoga con un agente fiduciario (Claude), ottiene backtest e report istituzionali, e — dopo conferma esplicita — può eseguire strategie on-chain tramite uno **SmartVault** personale.
 
 Il repository unifica tre pilastri in un unico prodotto:
 
@@ -43,7 +43,7 @@ Utente (browser + MetaMask)
               └── MockRwaPrimary (mint RWA testnet)
 ```
 
-**Principio:** LPFT (ricerca quant Python) e AFX (exchange + chat + on-chain) condividono lo stesso frontend e lo stesso flusso utente.
+**Principio:** LPFT (ricerca quant Python) e Agentic DeFi Layer (chat + on-chain) condividono lo stesso frontend e lo stesso flusso utente.
 
 ---
 
@@ -112,7 +112,7 @@ Usato per validazione istituzionale, worker in coda e integrazioni backend.
 | Chat web | TypeScript event-driven (o HFT per scalp) |
 | API / worker | Python `lpft_shared` |
 | Validazione CPCV/DSR pesante | Python Tier-1 |
-| Esecuzione on-chain | Keeper AFX (indipendente dal motore backtest) |
+| Esecuzione on-chain | Keeper (indipendente dal motore backtest) |
 
 Il backtest resta **off-chain**; l’on-chain esegue solo il trade confermato dall’utente.
 
