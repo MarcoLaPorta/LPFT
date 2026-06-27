@@ -7,7 +7,7 @@
 #   - foundry (cast, forge)
 #   - packages/contracts/.env con PRIVATE_KEY, ARBITRUM_SEPOLIA_RPC_URL
 #   - ETH Sepolia su Arbitrum (https://faucet.quicknode.com/arbitrum/sepolia)
-#   - VaultFactory + vault creato (vedi docs/DEPLOY_ARBITRUM_SEPOLIA.md)
+#   - VaultFactory + vault creato (vedi README.md root, sezione Testnet)
 #
 # Uso:
 #   cd packages/contracts
