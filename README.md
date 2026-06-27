@@ -178,6 +178,31 @@ Slippage protetto via quoter DEX su crypto; mint RWA via contratto primario mock
 
 ---
 
+## Mappa del codice
+
+Punto di partenza per esplorare il repository (codice attivo in `apps/web/`; `agentic-finance-exchange/` è archivio storico).
+
+| Pilastro | File chiave | Cosa leggere |
+|----------|-------------|--------------|
+| **IA** | `apps/web/app/api/chat/route.ts` | Entry point chat streaming |
+| | `apps/web/lib/afx-chat-tools.ts` | Tool Claude (analisi, backtest, esecuzione) |
+| | `apps/web/lib/afx-fiduciary-prompt.ts` | System prompt istituzionale |
+| | `apps/web/app/components/FiduciaryChat.tsx` | UI chat e widget |
+| **Backtest** | `apps/web/services/quant/event-driven-engine.ts` | Motore event-driven principale |
+| | `apps/web/services/quant/hft-engine.ts` | Motore HFT / microstructure |
+| | `apps/web/lib/afx-quant-compiler.ts` | JSON strategia → config engine |
+| | `apps/web/services/market_data/router.ts` | Routing dati Alpaca / Yahoo |
+| | `services/shared/lpft_shared/tier1/` | Validazione CPCV, DSR, Monte Carlo, CVaR |
+| | `services/api/lpft_api/main.py` | API Python LPFT |
+| **DeFi** | `packages/contracts/src/SmartVault.sol` | Vault ERC-4626 e RBAC |
+| | `apps/web/lib/services/web3-keeper.ts` | Keeper: quoter, calldata, submit tx |
+| | `apps/web/lib/afx-market-routing.ts` | Routing crypto vs RWA |
+| | `apps/web/lib/services/execution-sizing.ts` | Sizing trade on-chain |
+| | `apps/web/app/vault/page.tsx` | UI vault e wallet |
+| **Dati** | `apps/web/prisma/schema.prisma` | Modello dati (vault, execution, snapshot) |
+
+---
+
 ## Stato MVP
 
 **Implementato:** chat IA + tool, backtest TS/HFT, validazione Tier-1 Python, report analitici, vault UI, esecuzione testnet crypto e RWA, keeper con quoter, RLFF logging.
