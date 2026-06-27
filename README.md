@@ -1,8 +1,5 @@
 # LPFT · Agentic DeFi Layer
 
-> **Repository pubblico a scopo dimostrativo.**  
-> Il codice illustra l’architettura del prodotto; non include istruzioni di deploy, configurazione operativa né materiali per l’esecuzione in locale o su testnet.
-
 **Agentic DeFi Layer** è un exchange quantitativo non-custodial: l’utente dialoga con un agente fiduciario (Claude), ottiene backtest e report istituzionali, e — dopo conferma esplicita — può eseguire strategie on-chain tramite uno **SmartVault** personale.
 
 Il repository unifica tre pilastri in un unico prodotto:
