@@ -3,7 +3,6 @@
   "private": true,
   "description": "Comandi dalla root del repo (cartella Documents che contiene apps/ e services/).",
   "scripts": {
-    "start": "bash scripts/start-lpft.sh",
     "dev:web": "npm run dev --prefix apps/web",
     "dev:web:restart": "npm run dev:restart --prefix apps/web",
     "build:web": "npm run build --prefix apps/web"

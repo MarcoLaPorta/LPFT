@@ -18,7 +18,6 @@
     "keeper:loop": "SWEEP_INTERVAL_MS=5000 tsx scripts/sweep-execution-logs.ts",
     "seed:web3": "tsx scripts/seed-web3-local.ts",
     "seed:rwa": "tsx scripts/seed-rwa-tokens.ts",
-    "deploy:parse-forge": "tsx scripts/forge-deploy-to-env.ts",
     "rlff:export": "tsx scripts/export-rlff-dataset.ts",
     "worker:intents": "tsx scripts/intent-listener.ts",
     "postinstall": "prisma generate",
