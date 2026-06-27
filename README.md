@@ -188,4 +188,4 @@ Slippage protetto via quoter DEX su crypto; mint RWA via contratto primario mock
 
 ## Licenza
 
-Progetto di ricerca / MVP. Verifica le licenze delle dipendenze (OpenZeppelin, Uniswap, Anthropic, ecc.) prima di qualsiasi uso commerciale.
+**MVP** — Prototipo dimostrativo di exchange quantitativo agentico (IA, backtest, DeFi non-custodial); codice pubblico a scopo espositivo, non destinato a uso commerciale senza verifica delle licenze delle dipendenze.
