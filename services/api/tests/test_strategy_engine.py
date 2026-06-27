@@ -20,9 +20,10 @@ from lpft_api.capabilities import CapabilityStatus, assess_strategy_spec
 from lpft_api.assistant import _collect_requirement_snapshot, _requirements_clarification_plan
 from lpft_api.schemas import AssistantMessage
 from lpft_api.dsl import DataRequirements, StrategySpec
+from lpft_api.llm import normalize_strategy_spec
 from lpft_api.main import _period_from_spec
 from lpft_api.inline_backtest import run_generate_signals as api_run_generate_signals
-from lpft_api.program_llm import generate_program
+from lpft_api.program_llm import check_python_program_validation, generate_program
 from lpft_shared.engine import (
     ProgramSecurityError,
     build_validation_ohlcv,
@@ -40,6 +41,7 @@ from lpft_shared.market_data import (
     resolve_provider_candidates,
     validate_market_data,
 )
+import lpft_shared.market_data as lpft_market_data
 from lpft_worker.programs import run_generate_signals as worker_run_generate_signals
 
 
@@ -62,6 +64,38 @@ def _sample_market(length: int = 260) -> pd.DataFrame:
 
 
 class StrategyEngineTests(unittest.TestCase):
+    def test_normalize_strategy_spec_fills_history_and_notes(self) -> None:
+        spec = StrategySpec.model_validate(
+            {
+                "kind": "sma_crossover",
+                "params": {"fast": 10, "slow": 30, "price": "close"},
+                "risk": {"max_position_pct": 0.5, "fee_bps": 2, "slippage_bps": 1},
+                "universe": {"symbols": ["AAPL"], "timeframe": "1d"},
+                "execution": {"position_mode": "long_only", "rebalance": "equal_weight", "entry_timing": "next_bar_open"},
+                "data": {"market_model": "ohlcv", "requires_intrabar": False},
+            }
+        )
+        self.assertIsNone(spec.data.history_period)
+        n, meta = normalize_strategy_spec(spec)
+        self.assertEqual(n.data.history_period, "5y")
+        self.assertIsNotNone(n.data.notes)
+        self.assertIn("LPFT auto-summary", n.data.notes or "")
+        self.assertIn("history_period=5y", n.data.notes or "")
+        self.assertTrue(meta.applied)
+        self.assertIn("data.history_period", meta.fields_filled)
+        self.assertIn("data.notes", meta.fields_filled)
+
+    def test_check_python_program_validation_ast_and_security(self) -> None:
+        bad_syntax = "# LPFT-META: {}\ndef broken(\n"
+        v = check_python_program_validation(bad_syntax)
+        self.assertFalse(v.ast_ok)
+        self.assertTrue(v.security_ok)
+        ok = check_python_program_validation(
+            '# LPFT-META: {"k":"v"}\nimport pandas as pd\npandas = pd\ndef generate_positions(ohlcv):\n    return ohlcv["close"] * 0\n'
+        )
+        self.assertTrue(ok.ast_ok)
+        self.assertTrue(ok.security_ok)
+
     def test_capability_model_blocks_missing_market_data(self) -> None:
         spec = StrategySpec.model_validate(
             {
@@ -171,6 +205,82 @@ def generate_positions(ohlcv: pd.DataFrame) -> pd.Series:
         worker_positions = worker_run_generate_signals(code, ohlcv)
         self.assertTrue(api_positions.equals(worker_positions))
 
+    def test_run_backtest_uses_alpaca_microstructure_when_snapshot_has_quotes(self) -> None:
+        """Execution simulator runs on quote/trade timeline when snapshot includes microstructure."""
+        idx = pd.date_range("2024-01-01", periods=40, freq="D", tz="UTC")
+        close = pd.Series([100.0 + i * 0.1 for i in range(len(idx))], index=idx, dtype=float)
+        open_ = close.shift(1).fillna(close.iloc[0])
+        ohlcv = pd.DataFrame(
+            {
+                "open": open_.astype(float),
+                "high": (close + 0.2).astype(float),
+                "low": (close - 0.2).astype(float),
+                "close": close.astype(float),
+                "volume": pd.Series([1_000_000.0] * len(idx), index=idx),
+            },
+            index=idx,
+        )
+        qt_idx = pd.date_range(idx[0], idx[5], freq="2h", tz="UTC")
+        quotes = pd.DataFrame(
+            {
+                "bid": [100.0] * len(qt_idx),
+                "ask": [100.05] * len(qt_idx),
+                "bid_size": [10.0] * len(qt_idx),
+                "ask_size": [10.0] * len(qt_idx),
+            },
+            index=qt_idx,
+        )
+        report_request = DataRequest(
+            symbol="AAPL",
+            period="1y",
+            timeframe="1d",
+            asset_class="equity",
+            provider_preference="yahoo",
+            quality_policy="best_effort",
+            freshness_requirement="relaxed",
+            coverage_requirement="relaxed",
+            corporate_actions_required=False,
+            market=None,
+        )
+        _, report = validate_market_data(
+            report_request,
+            provider_requested="yahoo",
+            provider_used="yahoo",
+            fetched_at=pd.Timestamp.now(tz="UTC"),
+            ohlcv=ohlcv,
+        )
+        snap = MarketDataSnapshot(
+            symbol="AAPL",
+            canonical_symbol="AAPL",
+            asset_class="equity",
+            provider_used="yahoo",
+            period="1y",
+            timeframe="1d",
+            ohlcv=ohlcv,
+            quality=report,
+            execution_quotes=quotes,
+            execution_trades=None,
+        )
+        code = """# LPFT-META: {"artifact_type":"python","capability_status":"supported","capability_summary":"ok","engine_version":"lpft-engine-v2","fee_bps":0.0,"max_gross_exposure":1.0,"max_position_pct":1.0,"position_mode":"long_only","rebalance_mode":"equal_weight","signal_semantics":"target_position","slippage_bps":0.0,"strategy_kind":"python","symbols":["AAPL"],"timeframe":"1d","warnings":[]}
+import pandas as pd
+def generate_positions(ohlcv: pd.DataFrame) -> pd.Series:
+    return pd.Series(0.0, index=ohlcv.index)
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metrics = run_backtest_from_market_data({"AAPL": snap}, code, Path(tmpdir))
+            self.assertIn("total_return", metrics)
+            self.assertIn("execution_micro_total_cost_frac", metrics)
+            self.assertIn("execution_ohlcv_baseline_total_cost_frac", metrics)
+            val = json.loads((Path(tmpdir) / "validation.json").read_text())
+            self.assertEqual(
+                val["execution_model"]["execution_simulator"]["timeline_source"],
+                "microstructure_quotes_trades",
+            )
+            self.assertIsNotNone(val["execution_model"]["execution_simulator"].get("ohlcv_baseline_comparison"))
+            self.assertIn("pnl_and_equity_convention", val["execution_model"])
+            self.assertTrue((Path(tmpdir) / "equity_micro.csv").is_file())
+            self.assertTrue(val["execution_model"]["execution_simulator"].get("equity_micro_mtm_available"))
+
     def test_shared_engine_backtests_multi_symbol_portfolio(self) -> None:
         spec = StrategySpec.model_validate(
             {
@@ -237,6 +347,19 @@ def generate_positions(ohlcv: pd.DataFrame) -> pd.Series:
             api_run_generate_signals(code, _sample_market())
         self.assertIn("Initialize signal or position series with 0.0 instead of 0", str(ctx.exception))
 
+    def test_us_equity_rth_mask_excludes_weekend_and_extended_hours(self) -> None:
+        idx = pd.DatetimeIndex(
+            [
+                pd.Timestamp("2024-01-02 14:30:00", tz="UTC"),  # Tue morning US
+                pd.Timestamp("2024-01-06 14:30:00", tz="UTC"),  # Sat
+                pd.Timestamp("2024-01-02 21:00:00", tz="UTC"),  # Tue after US close
+            ]
+        )
+        m = lpft_market_data._us_equity_rth_mask(idx)
+        self.assertTrue(bool(m.iloc[0]))
+        self.assertFalse(bool(m.iloc[1]))
+        self.assertFalse(bool(m.iloc[2]))
+
     def test_cache_key_includes_provider_and_asset_class(self) -> None:
         equity_key = build_cache_key(
             DataRequest(symbol="AAPL", period="1y", timeframe="1d", asset_class="equity", provider_preference="auto"),
@@ -298,7 +421,7 @@ def generate_positions(ohlcv: pd.DataFrame) -> pd.Series:
         self.assertEqual(calls[:2], ["yahoo", "stooq"])
         self.assertEqual(snapshot.provider_used, "stooq")
 
-    def test_resolve_provider_candidates_alpaca_then_yahoo_for_equity(self) -> None:
+    def test_resolve_provider_candidates_legacy_alpaca_maps_to_auto(self) -> None:
         cands = resolve_provider_candidates(
             DataRequest(
                 symbol="AAPL",
@@ -308,7 +431,7 @@ def generate_positions(ohlcv: pd.DataFrame) -> pd.Series:
                 provider_preference="alpaca",
             )
         )
-        self.assertEqual(cands, ["alpaca", "yahoo"])
+        self.assertEqual(cands, ["yahoo", "stooq"])
 
     def test_resolve_provider_candidates_alpaca_crypto_uses_yahoo_only(self) -> None:
         cands = resolve_provider_candidates(
@@ -321,63 +444,6 @@ def generate_positions(ohlcv: pd.DataFrame) -> pd.Series:
             )
         )
         self.assertEqual(cands, ["yahoo"])
-
-    def test_provider_routing_alpaca_fails_over_to_yahoo(self) -> None:
-        calls: list[str] = []
-
-        def fake_fetch(provider: str, request: DataRequest) -> pd.DataFrame:
-            calls.append(provider)
-            if provider == "alpaca":
-                raise ValueError("Alpaca market data requires LPFT_ALPACA_API_KEY and LPFT_ALPACA_SECRET_KEY")
-            return _sample_market()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("lpft_shared.market_data.fetch_ohlcv_from_provider", side_effect=fake_fetch):
-                snapshot = load_market_data_snapshot(
-                    DataRequest(
-                        symbol="AAPL",
-                        period="1y",
-                        timeframe="1d",
-                        asset_class="equity",
-                        provider_preference="alpaca",
-                        quality_policy="best_effort",
-                        freshness_requirement="relaxed",
-                        coverage_requirement="relaxed",
-                    ),
-                    Path(tmpdir),
-                )
-        self.assertEqual(calls[:2], ["alpaca", "yahoo"])
-        self.assertEqual(snapshot.provider_used, "yahoo")
-
-    def test_fetch_alpaca_parses_bars(self) -> None:
-        payload = {
-            "bars": {
-                "AAPL": [
-                    {"t": "2024-01-02T05:00:00Z", "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.5, "v": 1000.0}
-                ]
-            },
-            "next_page_token": None,
-        }
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
-        mock_cm = MagicMock()
-        mock_cm.__enter__.return_value = mock_resp
-        mock_cm.__exit__.return_value = False
-        with patch.dict(os.environ, {"LPFT_ALPACA_API_KEY": "k", "LPFT_ALPACA_SECRET_KEY": "s"}):
-            with patch("lpft_shared.market_data.urllib.request.urlopen", return_value=mock_cm):
-                df = fetch_ohlcv_from_provider(
-                    "alpaca",
-                    DataRequest(
-                        symbol="AAPL",
-                        period="1y",
-                        timeframe="1d",
-                        asset_class="equity",
-                        provider_preference="alpaca",
-                    ),
-                )
-        self.assertFalse(df.empty)
-        self.assertIn("close", df.columns)
-        self.assertAlmostEqual(float(df["close"].iloc[-1]), 100.5)
 
     def test_bundle_quality_gate_blocks_when_one_symbol_fails(self) -> None:
         def fake_snapshot(request: DataRequest, storage_dir: Path):
@@ -441,6 +507,24 @@ def generate_positions(ohlcv: pd.DataFrame) -> pd.Series:
         assert plan is not None
         self.assertEqual(plan.mode, "clarify")
         self.assertTrue(plan.clarification_options)
+
+    def test_requirement_snapshot_ignores_default_client_symbol_without_explicit_flag(self) -> None:
+        snapshot = _collect_requirement_snapshot(
+            [AssistantMessage(role="user", content="Crea una strategia trend, daily")],
+            current_spec=None,
+            client_symbol="AAPL",
+            symbol_explicit=False,
+        )
+        self.assertIsNone(snapshot.instrument)
+
+    def test_requirement_snapshot_accepts_client_symbol_when_explicit(self) -> None:
+        snapshot = _collect_requirement_snapshot(
+            [AssistantMessage(role="user", content="Crea una strategia trend, daily")],
+            current_spec=None,
+            client_symbol="MSFT",
+            symbol_explicit=True,
+        )
+        self.assertEqual(snapshot.instrument, "MSFT")
 
     def test_requirement_snapshot_tracks_confirmed_inputs(self) -> None:
         snapshot = _collect_requirement_snapshot(

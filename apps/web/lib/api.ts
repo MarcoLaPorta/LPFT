@@ -3,27 +3,70 @@
  * In sviluppo, se non e' configurato esplicitamente, usiamo l'hostname
  * della pagina corrente cosi' il browser non prova a contattare il proprio localhost.
  */
+function isLocalDevHostname(host: string): boolean {
+  if (host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "0.0.0.0") return true;
+  if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  if (/^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  return false;
+}
+
 function resolveApiBase(): string {
   const explicitBase =
     typeof process !== "undefined"
       ? process.env.NEXT_PUBLIC_LPFT_API_BASE ?? process.env.NEXT_PUBLIC_API_URL
       : undefined;
-  if (explicitBase) return explicitBase;
+  if (explicitBase) return explicitBase.replace(/\/$/, "");
   if (typeof window !== "undefined") {
-    const protocol = window.location.protocol === "https:" ? "https:" : "http:";
-    return `${protocol}//${window.location.hostname}:8000`;
+    const host = window.location.hostname;
+    // Uvicorn in locale è solo HTTP: anche se la UI è servita in HTTPS (proxy/anteprima editor),
+    // non usare https:// per la porta 8000 altrimenti il browser mostra "Connection error".
+    const protocol = isLocalDevHostname(host) ? "http:" : window.location.protocol === "https:" ? "https:" : "http:";
+    return `${protocol}//${host}:8000`;
   }
   return "http://localhost:8000";
 }
 
+/** Safari/WebKit a volte usa messaggi diversi da "Failed to fetch". */
+function isNetworkFailureMessage(msg: string): boolean {
+  const m = msg.toLowerCase();
+  return (
+    m.includes("failed to fetch") ||
+    m.includes("networkerror") ||
+    m.includes("load failed") ||
+    m.includes("connection error") ||
+    m.includes("network connection") ||
+    m.includes("could not connect") ||
+    m.includes("the internet connection appears to be offline")
+  );
+}
+
+export function apiUnreachableHint(base: string): string {
+  return (
+    "Impossibile contattare l'API. Verifica che sia avviata (es. uvicorn su " +
+    base +
+    "). Apri la stessa base nel browser (http://127.0.0.1:8000/docs). " +
+    "Se usi Safari, prova anche http://127.0.0.1:3000 e crea apps/web/.env.local con NEXT_PUBLIC_LPFT_API_BASE=http://127.0.0.1:8000 poi riavvia Next."
+  );
+}
+
+/**
+ * Base URL dell'API: nel browser va ricalcolata a ogni uso così localhost e 127.0.0.1
+ * puntano allo stesso host dell'API.
+ */
+export function getApiBase(): string {
+  return resolveApiBase();
+}
+
+/** Snapshot al primo import (SSR); preferire getApiBase() nelle fetch dal browser. */
 export const API_BASE = resolveApiBase();
 
 export function datasetFileUrl(filename: string): string {
-  return `${API_BASE}/datasets/files/${encodeURIComponent(filename)}`;
+  return `${getApiBase()}/datasets/files/${encodeURIComponent(filename)}`;
 }
 
 export function artifactUrl(runId: number, filename: string): string {
-  return `${API_BASE}/runs/${runId}/artifacts/${encodeURIComponent(filename)}`;
+  return `${getApiBase()}/runs/${runId}/artifacts/${encodeURIComponent(filename)}`;
 }
 
 // --- Types (mirror backend schemas) ---
@@ -71,7 +114,7 @@ export interface StrategySpec {
     market_model?: "ohlcv" | "bid_ask" | "order_book" | "options";
     requires_intrabar?: boolean;
     asset_class?: "auto" | "equity" | "etf" | "crypto";
-    provider_preference?: "auto" | "yahoo" | "stooq" | "alpaca";
+    provider_preference?: "auto" | "yahoo" | "stooq";
     quality_policy?: "strict_gate" | "quality_labels" | "best_effort";
     freshness_requirement?: "relaxed" | "standard" | "strict";
     coverage_requirement?: "relaxed" | "standard" | "strict";
@@ -99,10 +142,31 @@ export interface CapabilityReport {
   quality_policy: string;
 }
 
+export interface StrategySpecNormalizationMeta {
+  applied: boolean;
+  fields_filled: string[];
+  notes_provenance?: "llm" | "server_auto" | "llm_enriched";
+  structured_output_mode?: "tool_use" | "text_json";
+  notes_enrichment_applied?: boolean;
+}
+
+export interface StrategyQualityPanel {
+  capability: CapabilityReport;
+  spec_normalization: StrategySpecNormalizationMeta;
+  notes: {
+    length: number;
+    provenance: "llm" | "server_auto" | "llm_enriched";
+    auto_prefix: boolean;
+    enrichment_applied: boolean;
+  };
+}
+
 export interface ValidationSummary {
   status: string;
   summary: string;
   warnings: string[];
+  compile_preflight?: { ast_ok: boolean; security_ok: boolean; detail?: string | null };
+  python_static?: { ast_ok: boolean; security_ok: boolean };
   data_sources?: Array<{
     provider_requested?: string;
     provider_used?: string;
@@ -133,7 +197,12 @@ export interface AssistantStreamRequest {
   current_run_id?: number | null;
   current_code?: string | null;
   current_spec?: StrategySpec | null;
+  /** When absent or default AAPL was used without user intent, send "" and symbol_explicit: false. */
   symbol?: string;
+  /** True only if the user named a ticker/ETF in chat, or there is an active spec/code to modify. */
+  symbol_explicit?: boolean;
+  /** Form «parametri strategia»: il backend forza kind python + codice generato da LLM. */
+  llm_python_only?: boolean;
   period?: string;
   timeframe?: string;
 }
@@ -143,7 +212,8 @@ async function req<T>(
   options?: RequestInit & { params?: Record<string, string> }
 ): Promise<T> {
   const { params, ...init } = options ?? {};
-  const url = params ? `${API_BASE}${path}?${new URLSearchParams(params)}` : `${API_BASE}${path}`;
+  const base = getApiBase();
+  const url = params ? `${base}${path}?${new URLSearchParams(params)}` : `${base}${path}`;
   let res: Response;
   try {
     res = await fetch(url, {
@@ -152,8 +222,8 @@ async function req<T>(
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes("Failed to fetch") || msg.includes("NetworkError") || msg.includes("Load failed")) {
-      throw new Error("Impossibile contattare l'API. Verifica che sia avviata su " + API_BASE);
+    if (isNetworkFailureMessage(msg)) {
+      throw new Error(apiUnreachableHint(base));
     }
     throw e;
   }
@@ -208,7 +278,11 @@ export const api = {
   },
   generate: {
     strategy: (description: string) =>
-      req<{ spec: StrategySpec }>("/generate-strategy", {
+      req<{
+        spec: StrategySpec;
+        spec_normalization?: StrategySpecNormalizationMeta;
+        strategy_quality?: StrategyQualityPanel;
+      }>("/generate-strategy", {
         method: "POST",
         body: JSON.stringify({ description }),
       }),
@@ -218,20 +292,21 @@ export const api = {
       callbacks: {
         onReasoningChunk: (chunk: string) => void;
         onSpec: (spec: StrategySpec) => void;
+        onStrategyQuality?: (payload: StrategyQualityPanel) => void;
         onError: (detail: string) => void;
       }
     ): Promise<void> => {
       let res: Response;
       try {
-        res = await fetch(`${API_BASE}/generate-strategy-stream`, {
+        res = await fetch(`${getApiBase()}/generate-strategy-stream`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ description }),
         });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        if (msg.includes("Failed to fetch") || msg.includes("NetworkError") || msg.includes("Load failed")) {
-          callbacks.onError("Impossibile contattare l'API. Verifica che sia avviata su " + API_BASE);
+        if (isNetworkFailureMessage(msg)) {
+          callbacks.onError(apiUnreachableHint(getApiBase()));
           return;
         }
         callbacks.onError(msg);
@@ -272,11 +347,20 @@ export const api = {
                   type: string;
                   chunk?: string;
                   spec?: Record<string, unknown>;
+                  spec_normalization?: StrategySpecNormalizationMeta;
                   detail?: string;
+                  capability?: CapabilityReport;
+                  notes?: StrategyQualityPanel["notes"];
                 };
                 if (data.type === "reasoning" && typeof data.chunk === "string") callbacks.onReasoningChunk(data.chunk);
                 else if (data.type === "spec" && data.spec) callbacks.onSpec(data.spec as unknown as StrategySpec);
-                else if (data.type === "error" && typeof data.detail === "string") callbacks.onError(data.detail);
+                else if (data.type === "strategy_quality" && callbacks.onStrategyQuality && data.capability && data.spec_normalization && data.notes) {
+                  callbacks.onStrategyQuality({
+                    capability: data.capability,
+                    spec_normalization: data.spec_normalization,
+                    notes: data.notes,
+                  });
+                } else if (data.type === "error" && typeof data.detail === "string") callbacks.onError(data.detail);
               } catch {
                 /* ignore parse errors for incomplete chunks */
               }
@@ -288,7 +372,10 @@ export const api = {
       }
     },
     program: (strategySpec: StrategySpec) =>
-      req<{ program: { code: string; language: string } }>("/generate-program", {
+      req<{
+        program: { code: string; language: string };
+        validation?: { ast_ok: boolean; security_ok: boolean };
+      }>("/generate-program", {
         method: "POST",
         body: JSON.stringify({ strategy_spec: strategySpec }),
       }),
@@ -312,6 +399,7 @@ export const api = {
         onSpec: (spec: StrategySpec) => void;
         onCode: (code: string) => void;
         onCapability: (payload: CapabilityReport) => void;
+        onStrategyQuality?: (payload: StrategyQualityPanel) => void;
         onValidation: (payload: ValidationSummary) => void;
         onUnsupportedStrategy: (payload: {
           detail: string;
@@ -333,15 +421,15 @@ export const api = {
     ): Promise<void> => {
       let res: Response;
       try {
-        res = await fetch(`${API_BASE}/assistant/stream`, {
+        res = await fetch(`${getApiBase()}/assistant/stream`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        if (msg.includes("Failed to fetch") || msg.includes("NetworkError") || msg.includes("Load failed")) {
-          callbacks.onError("Impossibile contattare l'API. Verifica che sia avviata su " + API_BASE);
+        if (isNetworkFailureMessage(msg)) {
+          callbacks.onError(apiUnreachableHint(getApiBase()));
           return;
         }
         callbacks.onError(msg);
@@ -402,7 +490,26 @@ export const api = {
               else if (data.type === "spec" && data.spec) callbacks.onSpec(data.spec as unknown as StrategySpec);
               else if (data.type === "code" && typeof data.code === "string") callbacks.onCode(data.code);
               else if (data.type === "capability" && data.capability) callbacks.onCapability(data.capability);
-              else if (data.type === "validation" && data.validation) callbacks.onValidation(data.validation);
+              else if (data.type === "strategy_quality") {
+                const raw = data as unknown as {
+                  type: string;
+                  capability?: CapabilityReport;
+                  spec_normalization?: StrategySpecNormalizationMeta;
+                  notes?: StrategyQualityPanel["notes"];
+                };
+                if (
+                  raw.capability &&
+                  raw.spec_normalization &&
+                  raw.notes &&
+                  callbacks.onStrategyQuality
+                ) {
+                  callbacks.onStrategyQuality({
+                    capability: raw.capability,
+                    spec_normalization: raw.spec_normalization,
+                    notes: raw.notes,
+                  });
+                }
+              } else if (data.type === "validation" && data.validation) callbacks.onValidation(data.validation);
               else if (data.type === "unsupported_strategy" && typeof data.detail === "string") {
                 callbacks.onUnsupportedStrategy({
                   detail: data.detail,
@@ -459,7 +566,7 @@ export const api = {
     upload: async (file: File) => {
       const form = new FormData();
       form.append("file", file);
-      const res = await fetch(`${API_BASE}/datasets/upload`, {
+      const res = await fetch(`${getApiBase()}/datasets/upload`, {
         method: "POST",
         body: form,
       });
@@ -478,7 +585,7 @@ export const api = {
       interval?: string,
       options?: {
         asset_class?: "auto" | "equity" | "etf" | "crypto";
-        provider_preference?: "auto" | "yahoo" | "stooq" | "alpaca";
+        provider_preference?: "auto" | "yahoo" | "stooq";
         quality_policy?: "strict_gate" | "quality_labels" | "best_effort";
       }
     ) => {
@@ -490,7 +597,7 @@ export const api = {
         provider_preference: options?.provider_preference ?? "auto",
         quality_policy: options?.quality_policy ?? "best_effort",
       });
-      const res = await fetch(`${API_BASE}/datasets/fetch?${params}`, { method: "POST" });
+      const res = await fetch(`${getApiBase()}/datasets/fetch?${params}`, { method: "POST" });
       const text = await res.text();
       if (!res.ok) throw new Error(text);
       if (!text.trim()) throw new Error("Risposta vuota");

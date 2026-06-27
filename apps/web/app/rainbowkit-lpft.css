@@ -1,0 +1,44 @@
+/* Override RainbowKit dopo styles.css — palette LPFT */
+
+[data-rk] {
+  --rk-colors-accentColor: #7c3aed;
+  --rk-colors-accentColorForeground: #ffffff;
+  --rk-colors-modalBackground: #050507;
+  --rk-colors-modalBackdrop: rgba(0, 0, 0, 0.78);
+  --rk-colors-modalBorder: rgba(255, 255, 255, 0.12);
+  --rk-colors-modalText: #e5e7eb;
+  --rk-colors-modalTextSecondary: rgba(229, 231, 235, 0.72);
+  --rk-colors-modalTextDim: rgba(229, 231, 235, 0.5);
+  --rk-colors-generalBorder: rgba(255, 255, 255, 0.08);
+  --rk-colors-menuItemBackground: rgba(124, 58, 237, 0.14);
+  --rk-colors-profileAction: rgba(255, 255, 255, 0.04);
+  --rk-colors-profileActionHover: rgba(124, 58, 237, 0.18);
+  --rk-colors-actionButtonSecondaryBackground: rgba(255, 255, 255, 0.04);
+  --rk-colors-closeButtonBackground: rgba(255, 255, 255, 0.06);
+  --rk-radii-actionButton: 12px;
+  --rk-radii-connectButton: 12px;
+  --rk-radii-modal: 18px;
+  --rk-radii-modalMobile: 18px;
+  --rk-fonts-body:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "Helvetica Neue", sans-serif;
+  --rk-shadows-dialog: 0 12px 40px rgba(0, 0, 0, 0.55), 0 0 64px rgba(124, 58, 237, 0.06);
+}
+
+/* Dialog / modale connessione */
+[data-rk] [role="dialog"] {
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+  background: linear-gradient(
+    145deg,
+    rgba(124, 58, 237, 0.12) 0%,
+    rgba(5, 5, 7, 0.98) 42%,
+    #050507 100%
+  ) !important;
+}
+
+/* Wallet list hover */
+[data-rk] button[data-testid]:hover,
+[data-rk] [role="button"]:hover {
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+}

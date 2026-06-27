@@ -1,0 +1,360 @@
+// Agentic Finance Exchange — schema dati (PostgreSQL / Supabase)
+// Obiettivi: tracciabilità non-custodial, RBAC (OWNER/MANAGER) riflesso a livello applicativo,
+// log esecuzioni IA per RLFF (ExecutionLog), estensioni RWA / AMM / RFQ.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identità & sessioni (UX intent-based)
+// ---------------------------------------------------------------------------
+
+/// Utente finale: identità principale = wallet (non-custodial).
+model User {
+  id            String   @id @default(cuid())
+  walletAddress String   @unique @map("wallet_address") /// Checksum 0x… lowercase consigliato lato app
+  /// Opzionale: collegamento account off-chain (es. magic link Supabase) — non sostituisce il wallet come OWNER on-chain.
+  email         String?  @unique
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  smartVaults        SmartVault[]
+  conversations      Conversation[]
+  executionLogs      ExecutionLog[]
+  rfqQuotes          RfqQuote[]
+  strategySnapshots  StrategySnapshot[]
+
+  @@map("users")
+}
+
+/// Report approfondito backtest / strategia quant (pagina /analysis/[id]).
+model StrategySnapshot {
+  id                String   @id @default(cuid())
+  userId            String   @map("user_id")
+  source            String   @db.VarChar(64)
+  symbol            String   @db.VarChar(32)
+  benchmark         String?  @db.VarChar(32)
+  intentClass       String?  @map("intent_class") @db.VarChar(32)
+  intentSummary     String?  @map("intent_summary") @db.Text
+  compiledStrategy  Json?    @map("compiled_strategy")
+  engineSpec        Json?    @map("engine_spec")
+  metrics           Json?
+  benchmarkMetrics  Json?    @map("benchmark_metrics")
+  equitySeries      Json?    @map("equity_series")
+  projections       Json?
+  trades            Json?
+  marketContext     Json?    @map("market_context")
+  marketRoutingMode String?  @map("market_routing_mode") @db.VarChar(32)
+  riskCapsApplied   Json?    @map("risk_caps_applied")
+  /// Fee istituzionale denormalizzata (bps) — opzionale per retrocompatibilità record legacy.
+  makerFeeBps       Int?     @map("maker_fee_bps")
+  takerFeeBps       Int?     @map("taker_fee_bps")
+  executionLogId    String?  @unique @map("execution_log_id")
+  /// Segnalibro utente: null = bozza/report automatico; valorizzato = in libreria strategie.
+  savedAt           DateTime? @map("saved_at")
+  title             String?   @db.VarChar(256)
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, savedAt])
+  @@map("strategy_snapshots")
+}
+
+/// Thread chat “intent-based”: raggruppa prompt e risposte prima di un’esecuzione on-chain.
+model Conversation {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  title     String?  @db.VarChar(512)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages      Message[]
+  executionLogs ExecutionLog[]
+
+  @@index([userId, createdAt])
+  @@map("conversations")
+}
+
+model Message {
+  id             String      @id @default(cuid())
+  conversationId String      @map("conversation_id")
+  role           MessageRole
+  content        String      @db.Text
+  /// Metadati modello (token, latency, id provider) — no segreti.
+  metadata       Json?
+  createdAt      DateTime    @default(now()) @map("created_at")
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@map("messages")
+}
+
+enum MessageRole {
+  user
+  assistant
+  system
+}
+
+// ---------------------------------------------------------------------------
+// Config on-chain mirror (whitelist router, factory) — audit & policy engine
+// ---------------------------------------------------------------------------
+
+/// Router DEX pre-approvati: solo questi indirizzi possono essere target di `executeTrade` dal MANAGER (backend).
+model WhitelistedDexRouter {
+  id        String      @id @default(cuid())
+  chainId   Int         @map("chain_id")
+  address   String      @map("address") /// 0x… contract router
+  name      String      @db.VarChar(128)
+  protocol  DexProtocol
+  active    Boolean     @default(true)
+  createdAt DateTime    @default(now()) @map("created_at")
+  updatedAt DateTime    @updatedAt @map("updated_at")
+
+  @@unique([chainId, address])
+  @@index([chainId, active])
+  @@map("whitelisted_dex_routers")
+}
+
+enum DexProtocol {
+  UNISWAP_V3
+  UNISWAP_V2
+  CURVE
+  OTHER
+}
+
+/// Deploy della VaultFactory per chain (riferimento off-chain; verità on-chain su explorer).
+model VaultFactoryConfig {
+  id                    String   @id @default(cuid())
+  chainId               Int      @unique @map("chain_id")
+  factoryAddress        String   @map("factory_address")
+  /// Opzionale: implementation beacon / implementation per trasparenza upgrade.
+  implementationAddress String?  @map("implementation_address")
+  deployedBlock         BigInt?  @map("deployed_block")
+  createdAt             DateTime @default(now()) @map("created_at")
+
+  @@map("vault_factory_configs")
+}
+
+// ---------------------------------------------------------------------------
+// SmartVault (istanza per utente) — mirror stato deploy
+// ---------------------------------------------------------------------------
+
+/// Un vault isolato per utente. OWNER = utente (withdraw); MANAGER = wallet backend (solo trade verso whitelist).
+model SmartVault {
+  id               String      @id @default(cuid())
+  userId           String      @map("user_id")
+  chainId          Int         @map("chain_id")
+  /// Indirizzo contratto SmartVault deployato.
+  vaultAddress     String      @unique @map("vault_address")
+  /// Wallet backend autorizzato come MANAGER on-chain (EOA o contratto guardiano).
+  managerAddress   String      @map("manager_address")
+  deployedAt       DateTime?   @map("deployed_at")
+  deploymentTxHash String?     @map("deployment_tx_hash")
+  status           VaultStatus @default(PENDING_DEPLOY)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  executionLogs ExecutionLog[]
+
+  @@index([userId, chainId])
+  @@index([chainId, status])
+  @@map("smart_vaults")
+}
+
+enum VaultStatus {
+  PENDING_DEPLOY
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+// ---------------------------------------------------------------------------
+// RWA registry (Mercato Primario — Fabbrica) — anagrafica token sintetici
+// ---------------------------------------------------------------------------
+
+/// Token RWA sintetico es. bAAPL: mint/burn 1:1 in finestra primaria (logica orari lato app/contratto).
+model RwaToken {
+  id                String  @id @default(cuid())
+  chainId           Int     @map("chain_id")
+  symbol            String  @db.VarChar(32)
+  /// Indirizzo ERC-20 del token sintetico on-chain.
+  tokenAddress      String  @map("token_address")
+  underlyingTicker  String  @map("underlying_ticker") /// es. AAPL
+  decimals          Int     @default(18)
+  /// Se true, solo flussi primari (mint/burn) consentiti in RTH; fuori orario RFQ.
+  primaryWindowOnly Boolean @default(true) @map("primary_window_only")
+  active            Boolean @default(true)
+  metadata          Json?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([chainId, tokenAddress])
+  @@index([chainId, symbol])
+  @@map("rwa_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// RFQ (Mercato Primario fuori RTH) — tracciamento quote / settlement atomico off-chain
+// ---------------------------------------------------------------------------
+
+model RfqQuote {
+  id             String    @id @default(cuid())
+  userId         String    @map("user_id")
+  chainId        Int       @map("chain_id")
+  /// Coppia logica es. bAAPL -> USDC
+  tokenIn        String    @map("token_in")
+  tokenOut       String    @map("token_out")
+  amountIn       Decimal   @map("amount_in") @db.Decimal(78, 0)
+  amountOut      Decimal   @map("amount_out") @db.Decimal(78, 0)
+  quoteProvider  String    @map("quote_provider") @db.VarChar(64)
+  validUntil     DateTime  @map("valid_until")
+  status         RfqStatus @default(OPEN)
+  /// Idempotency key lato matching engine.
+  idempotencyKey String?   @unique @map("idempotency_key")
+  settlementRef  String?   @map("settlement_ref") /// riferimento settlement atomico off-chain
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status, createdAt])
+  @@map("rfq_quotes")
+}
+
+enum RfqStatus {
+  OPEN
+  ACCEPTED
+  SETTLED
+  EXPIRED
+  CANCELLED
+  FAILED
+}
+
+// ---------------------------------------------------------------------------
+// ExecutionLog — core RLFF / audit IA (obbligatorio per ogni logica di trading)
+// ---------------------------------------------------------------------------
+
+/// Ogni azione rilevante dell’IA (proposta o esecuzione) deve essere loggata per reinforcement learning from feedback (RLFF).
+model ExecutionLog {
+  id String @id @default(cuid())
+
+  /// Idempotenza univoca (UUID consigliato) per proposte ed esecuzioni.
+  idempotencyKey String @unique @map("idempotency_key") @db.VarChar(64)
+
+  userId         String  @map("user_id")
+  smartVaultId   String? @map("smart_vault_id")
+  /// Collegamento opzionale al thread chat che ha generato l’intent.
+  conversationId String? @map("conversation_id")
+
+  /// Intento naturale dell’utente (es. "Proteggimi dal calo tecnologico").
+  userPrompt String @map("user_prompt") @db.Text
+
+  /// Chain-of-thought / ragionamento strutturato prodotto dal modello (Vercel AI SDK / Claude).
+  aiReasoning String @map("ai_reasoning") @db.Text
+
+  /// Esito economico normalizzato per training (PnL realizzato, fee, slippage stimato, currency, horizon…).
+  /// Schema JSON consigliato lato app: { "realizedPnlUsd": string, "feesUsd": string, "basis": "trade"|"simulation", ... }
+  pnlResult Json @map("pnl_result")
+
+  /// Serie equity / metriche backtest (CAGR, Sharpe, maxDD, curve sintetica) per dataset RLFF.
+  strategyMetrics Json? @map("strategy_metrics")
+
+  /// Classificazione azione (es. `proposeExecution`, `executePrimaryMarketSwap`, `executeSecondaryMarketSwap`).
+  actionType String? @map("action_type") @db.VarChar(64)
+
+  /// Payload strutturato proposta/esecuzione (router, path, importi) — no segreti.
+  payloadJson Json? @map("payload_json")
+
+  /// Classificazione mercato secondo le regole AFX (primario vs secondario / RFQ).
+  marketRoutingMode MarketRoutingMode @map("market_routing_mode")
+
+  /// Stato del ciclo esecuzione (proposta → firma → chain).
+  executionStatus ExecutionStatus @default(LOGGED_PROPOSAL) @map("execution_status")
+
+  /// Indirizzi coinvolti (validazione whitelist lato backend prima di firmare).
+  tokenInAddress  String? @map("token_in_address")
+  tokenOutAddress String? @map("token_out_address")
+  routerAddress   String? @map("router_address") /// deve esistere in WhitelistedDexRouter se AMM/ROUTER
+
+  chainId         Int?    @map("chain_id")
+  /// Hash calldata proposta (integrità); non salvare private key.
+  calldataDigest  String? @map("calldata_digest") @db.VarChar(66)
+  /// Tx on-chain se eseguita.
+  transactionHash String? @map("transaction_hash")
+  /// Blocco conferma (nullable fino a mining).
+  confirmedBlock  BigInt? @map("confirmed_block")
+
+  /// Modello LLM / versione prompt (per split dataset RLFF).
+  modelId      String? @map("model_id") @db.VarChar(128)
+  promptVersion String? @map("prompt_version") @db.VarChar(64)
+  promptTokens Int?    @map("prompt_tokens")
+  userFeedback String? @map("user_feedback") @db.Text
+  feedbackAt   DateTime? @map("feedback_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  smartVault   SmartVault?   @relation(fields: [smartVaultId], references: [id], onDelete: SetNull)
+  conversation Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([executionStatus, createdAt])
+  @@index([marketRoutingMode, createdAt])
+  @@map("execution_logs")
+}
+
+/// Mercato Primario (Fabbrica mint/burn 1:1 in RTH) vs Primario RFQ atomico off-hours vs Secondario AMM.
+enum MarketRoutingMode {
+  PRIMARY_MINT_BURN
+  PRIMARY_RFQ_ATOMIC
+  SECONDARY_AMM
+}
+
+// ---------------------------------------------------------------------------
+// Market data cache (Yahoo adjClose — replay backtest senza re-fetch)
+// ---------------------------------------------------------------------------
+
+/// Barra OHLCV giornaliera normalizzata (solo adjClose usato dal motore quant).
+model MarketDataBar {
+  id        String   @id @default(cuid())
+  symbol    String   @db.VarChar(32)
+  date      DateTime @db.Date
+  adjClose  Decimal  @map("adj_close") @db.Decimal(24, 8)
+  volume    Decimal? @db.Decimal(24, 2)
+  source    String   @default("yahoo") @db.VarChar(16)
+  fetchedAt DateTime @default(now()) @map("fetched_at")
+
+  @@unique([symbol, date])
+  @@index([symbol, date])
+  @@map("market_data_bars")
+}
+
+enum ExecutionStatus {
+  /// Bozza: proposta IA (tool `proposeExecution`).
+  DRAFT
+  /// Utente ha approvato in UI; in attesa di firma / submit RPC.
+  PENDING_SIGNATURE
+  /// In attesa di conferma on-chain (mock sweeper o miner reale).
+  PENDING
+  LOGGED_PROPOSAL
+  AWAITING_USER_SIGNATURE
+  AWAITING_MANAGER_SIGNATURE
+  SUBMITTED
+  CONFIRMED
+  FAILED
+  CANCELLED
+}

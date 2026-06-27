@@ -9,11 +9,13 @@ from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yfinance as yf
 
 DATA_VALIDATION_VERSION = "market-data-v1"
+EXECUTION_DATA_VERSION = "execution-v2"
 VALID_TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "1d")
 VALID_PERIODS = ("1m", "3m", "6m", "1y", "2y", "5y")
 PERIOD_ALIAS = {"1m": "1mo", "3m": "3mo", "6m": "6mo", "1y": "1y", "2y": "2y", "5y": "5y"}
@@ -73,6 +75,9 @@ class MarketDataSnapshot:
     timeframe: str
     ohlcv: pd.DataFrame
     quality: DataQualityReport
+    # Optional quote/trade microstructure (aligned to ohlcv time range); engine uses when present.
+    execution_quotes: pd.DataFrame | None = None
+    execution_trades: pd.DataFrame | None = None
 
 
 class DataQualityError(Exception):
@@ -129,16 +134,15 @@ def _safe_component(value: str) -> str:
 
 def build_cache_key(request: DataRequest, provider: str) -> str:
     canonical_symbol = canonicalize_symbol(request.symbol, request.asset_class)
-    return "__".join(
-        [
-            _safe_component(request.asset_class),
-            _safe_component(provider),
-            _safe_component(canonical_symbol),
-            _safe_component(normalize_period(request.period)),
-            _safe_component(normalize_timeframe(request.timeframe)),
-            DATA_VALIDATION_VERSION,
-        ]
-    )
+    parts = [
+        _safe_component(request.asset_class),
+        _safe_component(provider),
+        _safe_component(canonical_symbol),
+        _safe_component(normalize_period(request.period)),
+        _safe_component(normalize_timeframe(request.timeframe)),
+    ]
+    parts.append(DATA_VALIDATION_VERSION)
+    return "__".join(parts)
 
 
 def _cache_paths(storage_dir: Path, cache_key: str) -> tuple[Path, Path]:
@@ -217,7 +221,21 @@ def _normalize_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 def _fetch_yahoo(request: DataRequest) -> pd.DataFrame:
     ticker = yf.Ticker(canonicalize_symbol(request.symbol, request.asset_class))
-    df = ticker.history(period=PERIOD_ALIAS[normalize_period(request.period)], interval=normalize_timeframe(request.timeframe))
+    period = normalize_period(request.period)
+    timeframe = normalize_timeframe(request.timeframe)
+    yahoo_period = PERIOD_ALIAS[period]
+    # Yahoo has stricter intraday windows than our generic history periods.
+    # Adapt provider period to avoid hard failures like:
+    # "Only 8 days worth of 1m granularity data are allowed" / "within last 60 days".
+    if timeframe == "1m":
+        yahoo_period = "8d"
+    elif timeframe in {"5m", "15m", "30m"}:
+        # 60d is the practical upper bound for these granularities.
+        yahoo_period = "60d"
+    elif timeframe == "1h":
+        # Intraday hourly endpoint commonly allows up to ~730d.
+        yahoo_period = "730d" if period in {"5y"} else yahoo_period
+    df = ticker.history(period=yahoo_period, interval=timeframe)
     if df.empty:
         return df
     df = df.rename(
@@ -227,121 +245,6 @@ def _fetch_yahoo(request: DataRequest) -> pd.DataFrame:
             "Low": "low",
             "Close": "close",
             "Volume": "volume",
-        }
-    )
-    return _normalize_ohlcv_frame(df)
-
-
-def _alpaca_api_credentials() -> tuple[str, str] | None:
-    key = str(os.getenv("LPFT_ALPACA_API_KEY", "") or "").strip()
-    secret = str(os.getenv("LPFT_ALPACA_SECRET_KEY", "") or "").strip()
-    if not key or not secret:
-        return None
-    return key, secret
-
-
-_ALPACA_TIMEFRAME = {
-    "1d": "1Day",
-    "1h": "1Hour",
-    "30m": "30Min",
-    "15m": "15Min",
-    "5m": "5Min",
-    "1m": "1Min",
-}
-
-
-def _alpaca_period_bounds(request: DataRequest) -> tuple[str, str]:
-    """ISO8601 UTC start/end for Alpaca bars API."""
-    period = normalize_period(request.period)
-    end = pd.Timestamp.now(tz="UTC")
-    months = {"1m": 1, "3m": 3, "6m": 6, "1y": 12, "2y": 24, "5y": 60}[period]
-    start = end - pd.DateOffset(months=months)
-    return (
-        start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-    )
-
-
-def _fetch_alpaca(request: DataRequest) -> pd.DataFrame:
-    """
-    Historical US stock/ETF bars via Alpaca Market Data API v2.
-    Requires LPFT_ALPACA_API_KEY and LPFT_ALPACA_SECRET_KEY (paper or live keys work for data).
-    Optional: LPFT_ALPACA_DATA_BASE_URL (default https://data.alpaca.markets),
-    LPFT_ALPACA_DATA_FEED=iex|sip (default iex, SIP needs paid subscription).
-    """
-    creds = _alpaca_api_credentials()
-    if creds is None:
-        raise ValueError(
-            "Alpaca market data requires LPFT_ALPACA_API_KEY and LPFT_ALPACA_SECRET_KEY"
-        )
-    asset = infer_asset_class(request.symbol, request.asset_class)
-    if asset == "crypto":
-        raise ValueError(
-            "Alpaca stock bars API does not support crypto in this integration; use provider_preference=yahoo or auto"
-        )
-    symbol = canonicalize_symbol(request.symbol, asset)
-    timeframe = _ALPACA_TIMEFRAME.get(normalize_timeframe(request.timeframe))
-    if not timeframe:
-        raise ValueError(f"Alpaca unsupported timeframe: {request.timeframe}")
-    start, end = _alpaca_period_bounds(request)
-    base_url = str(os.getenv("LPFT_ALPACA_DATA_BASE_URL", "") or "").strip().rstrip("/")
-    if not base_url:
-        base_url = "https://data.alpaca.markets"
-    feed = str(os.getenv("LPFT_ALPACA_DATA_FEED", "iex") or "iex").strip().lower()
-    if feed not in {"iex", "sip"}:
-        feed = "iex"
-    key_id, secret = creds
-    bars_path = f"{base_url}/v2/stocks/bars"
-    collected: list[dict[str, Any]] = []
-    next_token: str | None = None
-    while True:
-        params: dict[str, str | int] = {
-            "symbols": symbol,
-            "timeframe": timeframe,
-            "start": start,
-            "end": end,
-            "feed": feed,
-            "adjustment": "all",
-            "limit": 10000,
-        }
-        if next_token:
-            params["page_token"] = next_token
-        query = urllib.parse.urlencode(params)
-        url = f"{bars_path}?{query}"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "APCA-API-KEY-ID": key_id,
-                "APCA-API-SECRET-KEY": secret,
-                "Accept": "application/json",
-            },
-            method="GET",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=90) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-            raise ValueError(f"Alpaca HTTP {exc.code}: {body[:500]}") from exc
-        except urllib.error.URLError as exc:
-            raise ValueError(f"Alpaca request failed: {exc}") from exc
-        sym_bars = (payload.get("bars") or {}).get(symbol) or []
-        for b in sym_bars:
-            collected.append(b)
-        next_token = payload.get("next_page_token")
-        if not next_token:
-            break
-    if not collected:
-        return pd.DataFrame()
-    df = pd.DataFrame(collected)
-    df = df.rename(
-        columns={
-            "t": "datetime",
-            "o": "open",
-            "h": "high",
-            "l": "low",
-            "c": "close",
-            "v": "volume",
         }
     )
     return _normalize_ohlcv_frame(df)
@@ -370,14 +273,34 @@ def _fetch_stooq(request: DataRequest) -> pd.DataFrame:
     return _normalize_ohlcv_frame(df)
 
 
+def _us_equity_rth_mask(index: pd.DatetimeIndex) -> pd.Series:
+    """
+    Regular US equity session (Mon–Fri), 09:30–16:00 America/New_York.
+    Disable with LPFT_EQUITY_RTH_FILTER=0.
+    """
+    if index.empty:
+        return pd.Series(dtype=bool)
+    flag = str(os.getenv("LPFT_EQUITY_RTH_FILTER", "1") or "1").strip().lower()
+    if flag in {"0", "false", "no", "off"}:
+        return pd.Series(True, index=index)
+    ny = ZoneInfo("America/New_York")
+    if index.tz is None:
+        idx = index.tz_localize("UTC")
+    else:
+        idx = index.tz_convert("UTC")
+    local = idx.tz_convert(ny)
+    minute = local.hour * 60 + local.minute
+    open_m, close_m = 9 * 60 + 30, 16 * 60
+    ok = (local.dayofweek < 5) & (minute >= open_m) & (minute < close_m)
+    return pd.Series(ok, index=index)
+
+
 def fetch_ohlcv_from_provider(provider: str, request: DataRequest) -> pd.DataFrame:
     provider_norm = provider.strip().lower()
     if provider_norm == "yahoo":
         return _fetch_yahoo(request)
     if provider_norm == "stooq":
         return _fetch_stooq(request)
-    if provider_norm == "alpaca":
-        return _fetch_alpaca(request)
     raise ValueError(f"Unsupported provider: {provider_norm}")
 
 
@@ -385,10 +308,7 @@ def resolve_provider_candidates(request: DataRequest) -> list[str]:
     timeframe = normalize_timeframe(request.timeframe)
     preferred = str(request.provider_preference or "auto").strip().lower()
     if preferred == "alpaca":
-        asset = infer_asset_class(request.symbol, request.asset_class)
-        if asset == "crypto":
-            return ["yahoo"]
-        return ["alpaca", "yahoo"]
+        preferred = "auto"
     if preferred and preferred != "auto":
         return [preferred]
     if request.asset_class == "crypto":
@@ -603,6 +523,7 @@ def load_market_data_snapshot(request: DataRequest, storage_dir: Path) -> Market
                     manifest_path=manifest_path,
                     fallback_used=provider_index > 0,
                 )
+                eq, et = None, None
                 return MarketDataSnapshot(
                     symbol=request.symbol,
                     canonical_symbol=canonicalize_symbol(request.symbol, request.asset_class),
@@ -612,6 +533,8 @@ def load_market_data_snapshot(request: DataRequest, storage_dir: Path) -> Market
                     timeframe=request.timeframe,
                     ohlcv=normalized,
                     quality=report,
+                    execution_quotes=eq,
+                    execution_trades=et,
                 )
             except DataQualityError as exc:
                 last_error = exc.report.get("summary", str(exc))
@@ -635,6 +558,7 @@ def load_market_data_snapshot(request: DataRequest, storage_dir: Path) -> Market
             csv_path.parent.mkdir(parents=True, exist_ok=True)
             normalized.to_csv(csv_path)
             manifest_path.write_text(json.dumps(report.to_dict(), indent=2))
+            eq, et = None, None
             return MarketDataSnapshot(
                 symbol=request.symbol,
                 canonical_symbol=canonicalize_symbol(request.symbol, request.asset_class),
@@ -644,6 +568,8 @@ def load_market_data_snapshot(request: DataRequest, storage_dir: Path) -> Market
                 timeframe=request.timeframe,
                 ohlcv=normalized,
                 quality=report,
+                execution_quotes=eq,
+                execution_trades=et,
             )
         except DataQualityError as exc:
             last_error = exc.report.get("summary", str(exc))
@@ -758,3 +684,86 @@ def load_market_data_bundle(
             }
         )
     return snapshots
+
+
+# ---------------------------------------------------------------------------
+# Oracoli on-chain (interfacce + mock) — Chainlink / Pyth style per simulazioni DEX
+# ---------------------------------------------------------------------------
+
+
+class OraclePriceFeed:
+    """Protocollo minimale: mid price con possibile staleness (blocchi)."""
+
+    def read_mid(self, symbol: str) -> float:
+        raise NotImplementedError
+
+    def staleness_blocks(self) -> int:
+        return 0
+
+
+class MockChainlinkStyleOracle(OraclePriceFeed):
+    """Mock Chainlink: ritardo fisso + piccolo bias deterministico."""
+
+    def __init__(self, *, stale_blocks: int = 1, bias_bps: float = 2.0) -> None:
+        self._stale = max(0, int(stale_blocks))
+        self._bias = float(bias_bps)
+
+    def read_mid(self, symbol: str) -> float:
+        s = str(symbol or "UNKNOWN").encode("utf-8")
+        base = 100.0 + (sum(s) % 50)
+        return base * (1.0 + self._bias / 10_000.0)
+
+    def staleness_blocks(self) -> int:
+        return self._stale
+
+
+class MockPythStyleOracle(OraclePriceFeed):
+    """Mock Pyth: confidence band implicita via jitter sul mid."""
+
+    def __init__(self, *, stale_blocks: int = 0, jitter_bps: float = 3.0) -> None:
+        self._stale = max(0, int(stale_blocks))
+        self._jitter = float(jitter_bps)
+
+    def read_mid(self, symbol: str) -> float:
+        s = str(symbol or "X").encode("utf-8")
+        base = 50.0 + (sum(s) % 30)
+        jitter = (sum(s) % 7 - 3) * (self._jitter / 10_000.0)
+        return base * (1.0 + jitter)
+
+    def staleness_blocks(self) -> int:
+        return self._stale
+
+
+def default_onchain_oracle_bundle() -> tuple[MockChainlinkStyleOracle, MockPythStyleOracle]:
+    """Coppia mock usabile dai test o da wrapper che arricchiscono ProgramMetadata."""
+    return MockChainlinkStyleOracle(stale_blocks=1, bias_bps=2.5), MockPythStyleOracle(stale_blocks=0, jitter_bps=4.0)
+
+
+def suggested_dex_execution_overhead(
+    *,
+    symbol: str,
+    chainlink: OraclePriceFeed | None = None,
+    pyth: OraclePriceFeed | None = None,
+) -> dict[str, float | int]:
+    """
+    Euristica per LPFT-META / backtest: latenza in barre e spread sintetico DEX (bps).
+    Non chiama rete; i mock servono a rendere esplicito il gap vs dati Web2 perfetti.
+    """
+    cl = chainlink or MockChainlinkStyleOracle()
+    py = pyth or MockPythStyleOracle()
+    stale = max(cl.staleness_blocks(), py.staleness_blocks())
+    ac = infer_asset_class(symbol, None)
+    base_spread = 6.0 if ac == "crypto" else 4.0
+    return {
+        "onchain_latency_bars": int(stale),
+        "dex_synthetic_spread_bps": float(base_spread + abs(hash(symbol)) % 5),
+    }
+
+
+if __name__ == "__main__":
+    import sys
+
+    sym = sys.argv[1] if len(sys.argv) > 1 else "AAPL"
+    req = DataRequest(symbol=sym, period="1y", timeframe="1d", asset_class="equity", provider_preference="yahoo")
+    df = _fetch_yahoo(req)
+    print(json.dumps({"symbol": sym, "rows": int(len(df))}, indent=2))

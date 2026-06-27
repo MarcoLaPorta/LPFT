@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json as _json
+import logging
 import re
 import shutil
 import uuid
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from sqlmodel import Session, select
@@ -16,11 +17,17 @@ from lpft_api.assistant import build_strategy_prompt, plan_assistant_turn, strea
 from lpft_api.capabilities import CapabilityStatus, assess_strategy_spec
 from lpft_api.config import settings
 from lpft_api.db import Run, RunStatus, RunType, Strategy, engine, init_db
-from lpft_api.dsl import StrategySpec
+from lpft_api.dsl import StrategySpec, coerce_spec_to_python_llm_implementation
 from lpft_api.llm import generate_strategy_spec, generate_strategy_spec_stream
 from lpft_api.inline_backtest import run_generate_signals, run_inline_backtest
-from lpft_api.program_llm import generate_program, repair_program
-from lpft_api.queue import get_queue
+from lpft_api.program_llm import (
+    check_python_program_validation,
+    compile_preflight_dict,
+    generate_program,
+    repair_program,
+)
+from lpft_api.queue import get_queue, lpft_worker_available
+from lpft_api.intent_publisher import publish_executable_intent
 from lpft_shared.engine import build_validation_ohlcv, extract_program_metadata, write_validation_artifact
 from lpft_shared.market_data import (
     DataQualityError,
@@ -30,6 +37,8 @@ from lpft_shared.market_data import (
     load_market_data_snapshot,
     normalize_period,
 )
+
+from lpft_api.tier1_routes import router as tier1_router
 from lpft_api.schemas import (
     AssistantStreamRequest,
     DatasetFetchResponse,
@@ -41,15 +50,21 @@ from lpft_api.schemas import (
     GenerateProgramResponse,
     GenerateStrategyRequest,
     GenerateStrategyResponse,
+    PythonProgramValidation,
     RunCreate,
     RunOut,
     RunProgramRequest,
     RunProgramResponse,
     StrategyCreate,
+    StrategyNotesQuality,
     StrategyOut,
+    StrategyQualityPanel,
 )
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="LPFT API", version="0.1.0")
+app.include_router(tier1_router, prefix="/quant/tier1", tags=["tier1"])
 
 CORS_ORIGINS = [
     "http://localhost:3000",
@@ -146,6 +161,7 @@ app.add_middleware(AddCorsToAllResponsesMiddleware)
 @app.on_event("startup")
 def on_startup():
     init_db()
+    logger.info("Database URL (prefix): %s", str(settings.database_url)[:120])
 
 
 @app.exception_handler(Exception)
@@ -171,6 +187,13 @@ def _safe_filename(name: str) -> bool:
 @app.get("/")
 def root():
     return {"status": "ok"}
+
+
+@app.get("/demo")
+def redirect_demo_to_frontend():
+    """Compat: la vecchia pagina demo è stata rimossa; reindirizza alla home Next."""
+    fe = settings.frontend_base_url.rstrip("/")
+    return RedirectResponse(f"{fe}/", status_code=307)
 
 
 @app.get("/datasets/files/{filename}", response_class=FileResponse)
@@ -266,13 +289,45 @@ def _timeframe_from_spec(spec: StrategySpec, fallback: str = "1d") -> str:
 def _period_from_spec(spec: StrategySpec, fallback: str = "1y") -> str:
     """Lookback storico per OHLCV (1m…5y): da data.history_period se valorizzato, altrimenti fallback (es. richiesta client)."""
     hp = spec.data.history_period
-    if hp is None:
-        return fallback or "1y"
-    raw = getattr(hp, "value", str(hp))
+    raw = fallback or "1y"
+    if hp is not None:
+        raw = getattr(hp, "value", str(hp))
     try:
-        return normalize_period(str(raw))
+        requested = normalize_period(str(raw))
     except ValueError:
-        return fallback or "1y"
+        requested = "1y"
+    timeframe = _timeframe_from_spec(spec, "1d")
+    # Intraday ceiling: extend maximum to at least one year (instead of short windows).
+    # Keep requested period unless it exceeds the supported intraday max.
+    intraday_max_period = {
+        "1m": "1y",
+        "5m": "1y",
+        "15m": "1y",
+        "30m": "1y",
+        "1h": "2y",
+    }
+    max_p = intraday_max_period.get(timeframe)
+    if not max_p:
+        return requested
+    rank = {"1m": 0, "3m": 1, "6m": 2, "1y": 3, "2y": 4, "5y": 5}
+    if rank.get(requested, 3) > rank.get(max_p, 3):
+        logger.info(
+            "Clamping history_period from %s to %s for intraday timeframe=%s.",
+            requested,
+            max_p,
+            timeframe,
+        )
+        return max_p
+    return requested
+
+
+def _assistant_primary_symbol(body: AssistantStreamRequest, spec: StrategySpec) -> str:
+    """Prefer client symbol when set; otherwise first symbol from generated spec."""
+    if body.symbol and str(body.symbol).strip():
+        return str(body.symbol).strip().upper()
+    if spec.universe.symbols:
+        return str(spec.universe.symbols[0]).upper()
+    return "AAPL"
 
 
 def _generate_valid_program(strategy_spec, *, symbol: str, timeframe: str) -> tuple[str, dict]:
@@ -282,6 +337,7 @@ def _generate_valid_program(strategy_spec, *, symbol: str, timeframe: str) -> tu
         "status": "valid",
         "summary": "The compiled strategy passed shared-engine preflight validation.",
         "warnings": [],
+        "compile_preflight": compile_preflight_dict(code),
     }
     try:
         run_generate_signals(code, sample)
@@ -293,9 +349,24 @@ def _generate_valid_program(strategy_spec, *, symbol: str, timeframe: str) -> tu
             validation["summary"] = "The deterministic strategy failed the shared-engine preflight validation."
             raise
         repaired = repair_program(strategy_spec, code, str(e))
+        validation["compile_preflight"] = compile_preflight_dict(repaired)
         run_generate_signals(repaired, sample)
         validation["summary"] = "The custom Python strategy needed one repair pass before validation."
         return repaired, validation
+
+
+def _build_strategy_quality_panel(spec, spec_norm, capability) -> StrategyQualityPanel:
+    n = (spec.data.notes or "").strip() if spec.data else ""
+    return StrategyQualityPanel(
+        capability=capability.model_dump(),
+        spec_normalization=spec_norm,
+        notes=StrategyNotesQuality(
+            length=len(n),
+            provenance=spec_norm.notes_provenance,
+            auto_prefix=n.startswith("LPFT auto-summary"),
+            enrichment_applied=spec_norm.notes_enrichment_applied,
+        ),
+    )
 
 
 def _preflight_market_data(program_code: str, *, symbol: str, period: str, timeframe: str) -> dict:
@@ -390,10 +461,29 @@ def _inline_complete_run(run_id: int, *, symbol: str, period: str, timeframe: st
 
 
 def _enqueue_backtest_with_fallback(run_id: int, *, symbol: str, period: str, timeframe: str, program_code: str) -> None:
+    """
+    Accoda su RQ solo se c'è un worker attivo sulla coda ``lpft``.
+    Altrimenti (Redis assente, worker non avviato, enqueue fallito) esegue il backtest inline nello stesso processo API.
+    """
     try:
-        q = get_queue()
-        q.enqueue("lpft_worker.jobs.run_backtest_job", run_id, job_id=f"run_{run_id}")
-    except Exception:
+        if lpft_worker_available():
+            q = get_queue()
+            q.enqueue("lpft_worker.jobs.run_backtest_job", run_id, job_id=f"run_{run_id}")
+            logger.info("Backtest run_id=%s enqueued to RQ (lpft worker available)", run_id)
+        else:
+            logger.info(
+                "No RQ worker on queue lpft; running backtest inline for run_id=%s (start worker or Redis to use queue)",
+                run_id,
+            )
+            _inline_complete_run(
+                run_id,
+                symbol=symbol,
+                period=period,
+                timeframe=timeframe,
+                program_code=program_code,
+            )
+    except Exception as exc:
+        logger.warning("Backtest enqueue failed (%s); inline fallback for run_id=%s", exc, run_id)
         _inline_complete_run(
             run_id,
             symbol=symbol,
@@ -420,14 +510,33 @@ def _create_program_run(*, program_code: str, symbol: str, period: str, timefram
         return int(run.id)
 
 
+def _reasoning_from_spec(spec: StrategySpec, spec_norm: object | None, *, max_len: int = 14000) -> str:
+    parts: list[str] = []
+    if spec_norm is not None and hasattr(spec_norm, "model_dump"):
+        parts.append(_json.dumps(spec_norm.model_dump(), default=str))
+    parts.append(_json.dumps(spec.model_dump(), default=str))
+    body = "\n---\n".join(parts)
+    return body[:max_len]
+
+
 def _stream_generate_strategy(description: str, origin: str | None):
     """Generator SSE: eventi data con type=reasoning chunk o type=spec."""
     try:
-        for chunk, spec in generate_strategy_spec_stream(description):
+        for chunk, spec, spec_norm in generate_strategy_spec_stream(description):
             if chunk is not None:
                 yield f"data: {_json.dumps({'type': 'reasoning', 'chunk': chunk})}\n\n"
             elif spec is not None:
-                yield f"data: {_json.dumps({'type': 'spec', 'spec': spec.model_dump()})}\n\n"
+                yield f"data: {_json.dumps({'type': 'spec', 'spec': spec.model_dump(), 'spec_normalization': spec_norm.model_dump()})}\n\n"
+                capability = assess_strategy_spec(spec)
+                sq = _build_strategy_quality_panel(spec, spec_norm, capability)
+                yield f"data: {_json.dumps({'type': 'strategy_quality', **sq.model_dump()})}\n\n"
+                publish_executable_intent(
+                    user_prompt=description,
+                    ai_reasoning=_reasoning_from_spec(spec, spec_norm),
+                    strategy_spec=spec.model_dump(),
+                    symbol=(spec.universe.symbols[0] if spec.universe.symbols else None),
+                    model_id=settings.llm_model,
+                )
     except Exception as e:
         yield f"data: {_json.dumps({'type': 'error', 'detail': str(e)})}\n\n"
 
@@ -461,6 +570,7 @@ def _stream_assistant(body: AssistantStreamRequest):
                 symbol=body.symbol,
                 period=body.period,
                 timeframe=body.timeframe,
+                symbol_explicit=body.symbol_explicit,
             )
         except Exception:
             for chunk in stream_answer(
@@ -471,6 +581,7 @@ def _stream_assistant(body: AssistantStreamRequest):
                 symbol=body.symbol,
                 period=body.period,
                 timeframe=body.timeframe,
+                symbol_explicit=body.symbol_explicit,
             ):
                 if chunk:
                     yield f"data: {_json.dumps({'type': 'assistant', 'chunk': chunk})}\n\n"
@@ -494,6 +605,7 @@ def _stream_assistant(body: AssistantStreamRequest):
                 period=body.period,
                 timeframe=body.timeframe,
                 analysis_prompt=plan.analysis_prompt,
+                symbol_explicit=body.symbol_explicit,
             ):
                 if chunk:
                     yield f"data: {_json.dumps({'type': 'assistant', 'chunk': chunk})}\n\n"
@@ -512,21 +624,33 @@ def _stream_assistant(body: AssistantStreamRequest):
             symbol=body.symbol,
             period=body.period,
             timeframe=body.timeframe,
+            symbol_explicit=body.symbol_explicit,
         )
 
         spec = None
-        for chunk, maybe_spec in generate_strategy_spec_stream(strategy_prompt):
+        spec_norm = None
+        for chunk, maybe_spec, maybe_norm in generate_strategy_spec_stream(strategy_prompt):
             if chunk is not None:
                 yield f"data: {_json.dumps({'type': 'reasoning', 'chunk': chunk})}\n\n"
             elif maybe_spec is not None:
                 spec = maybe_spec
-                yield f"data: {_json.dumps({'type': 'spec', 'spec': spec.model_dump()})}\n\n"
+                spec_norm = maybe_norm
+                if body.llm_python_only:
+                    spec = coerce_spec_to_python_llm_implementation(spec)
+                    # coerce può cambiare kind/params: la normalizzazione resta riferita alla spec LLM originale
+                payload = {"type": "spec", "spec": spec.model_dump()}
+                if spec_norm is not None:
+                    payload["spec_normalization"] = spec_norm.model_dump()
+                yield f"data: {_json.dumps(payload)}\n\n"
 
         if spec is None:
             raise ValueError("Strategy generation did not return a valid spec")
 
         capability = assess_strategy_spec(spec)
         yield f"data: {_json.dumps({'type': 'capability', 'capability': capability.model_dump()})}\n\n"
+        if spec_norm is not None:
+            sq = _build_strategy_quality_panel(spec, spec_norm, capability).model_dump()
+            yield f"data: {_json.dumps({'type': 'strategy_quality', **sq})}\n\n"
         if capability.status in {
             CapabilityStatus.unsupported_missing_data,
             CapabilityStatus.unsupported_with_conversion_path,
@@ -537,48 +661,59 @@ def _stream_assistant(body: AssistantStreamRequest):
 
         backtest_timeframe = _timeframe_from_spec(spec, body.timeframe or "1d")
         backtest_period = _period_from_spec(spec, body.period or "1y")
+        run_symbol = _assistant_primary_symbol(body, spec)
         code, validation = _generate_valid_program(
             spec,
-            symbol=body.symbol or "AAPL",
+            symbol=run_symbol,
             timeframe=backtest_timeframe,
         )
+        validation["python_static"] = check_python_program_validation(code).model_dump()
         validation["warnings"] = list(dict.fromkeys([*capability.warnings, *validation.get("warnings", [])]))
-        if plan.should_backtest:
-            try:
-                data_validation = _preflight_market_data(
-                    code,
-                    symbol=body.symbol or "AAPL",
-                    period=backtest_period,
-                    timeframe=backtest_timeframe,
-                )
-            except DataQualityError as exc:
-                yield f"data: {_json.dumps({'type': 'validation', 'validation': {'status': 'invalid', 'summary': exc.report.get('summary', 'Market data quality rejected'), 'warnings': exc.report.get('warnings', []), 'data_sources': exc.report.get('symbol_errors', []) or [exc.report]}})}\n\n"
-                yield f"data: {_json.dumps({'type': 'unsupported_strategy', 'detail': exc.report.get('summary', 'Market data quality rejected'), 'missing_requirements': [], 'conversion_suggestions': ['Try daily bars', 'Use a different symbol', 'Reduce the lookback range'], 'warnings': exc.report.get('warnings', [])})}\n\n"
-                yield f"data: {_json.dumps({'type': 'done'})}\n\n"
-                return
-            validation["status"] = data_validation["status"]
-            validation["summary"] = data_validation["summary"]
-            validation["warnings"] = list(dict.fromkeys([*validation.get("warnings", []), *data_validation.get("warnings", [])]))
-            validation["data_sources"] = data_validation.get("data_sources", [])
+        # Sempre: dopo generazione/modifica di una strategia supportata → preflight dati + creazione run + backtest.
+        # (Il flag plan.should_backtest del planner non deve più saltare il backtest.)
+        try:
+            data_validation = _preflight_market_data(
+                code,
+                symbol=run_symbol,
+                period=backtest_period,
+                timeframe=backtest_timeframe,
+            )
+        except DataQualityError as exc:
+            yield f"data: {_json.dumps({'type': 'validation', 'validation': {'status': 'invalid', 'summary': exc.report.get('summary', 'Market data quality rejected'), 'warnings': exc.report.get('warnings', []), 'data_sources': exc.report.get('symbol_errors', []) or [exc.report]}})}\n\n"
+            yield f"data: {_json.dumps({'type': 'unsupported_strategy', 'detail': exc.report.get('summary', 'Market data quality rejected'), 'missing_requirements': [], 'conversion_suggestions': ['Try daily bars', 'Use a different symbol', 'Reduce the lookback range'], 'warnings': exc.report.get('warnings', [])})}\n\n"
+            yield f"data: {_json.dumps({'type': 'done'})}\n\n"
+            return
+        validation["status"] = data_validation["status"]
+        validation["summary"] = data_validation["summary"]
+        validation["warnings"] = list(dict.fromkeys([*validation.get("warnings", []), *data_validation.get("warnings", [])]))
+        validation["data_sources"] = data_validation.get("data_sources", [])
         yield f"data: {_json.dumps({'type': 'validation', 'validation': validation})}\n\n"
         yield f"data: {_json.dumps({'type': 'code', 'code': code})}\n\n"
 
-        if plan.should_backtest:
-            run_id = _create_program_run(
-                program_code=code,
-                symbol=body.symbol or "AAPL",
-                period=backtest_period,
-                timeframe=backtest_timeframe,
-            )
-            _enqueue_backtest_with_fallback(
-                run_id,
-                symbol=body.symbol or "AAPL",
-                period=backtest_period,
-                timeframe=backtest_timeframe,
-                program_code=code,
-            )
-            yield f"data: {_json.dumps({'type': 'run_status', 'run_id': run_id, 'status': 'pending'})}\n\n"
-            yield f"data: {_json.dumps({'type': 'run', 'run_id': run_id, 'code': code, 'spec': spec.model_dump(), 'params': {'symbol': body.symbol or 'AAPL', 'period': backtest_period, 'timeframe': backtest_timeframe}})}\n\n"
+        run_id = _create_program_run(
+            program_code=code,
+            symbol=run_symbol,
+            period=backtest_period,
+            timeframe=backtest_timeframe,
+        )
+        _enqueue_backtest_with_fallback(
+            run_id,
+            symbol=run_symbol,
+            period=backtest_period,
+            timeframe=backtest_timeframe,
+            program_code=code,
+        )
+        yield f"data: {_json.dumps({'type': 'run_status', 'run_id': run_id, 'status': 'pending'})}\n\n"
+        run_payload = {
+            "type": "run",
+            "run_id": run_id,
+            "code": code,
+            "spec": spec.model_dump(),
+            "params": {"symbol": run_symbol, "period": backtest_period, "timeframe": backtest_timeframe},
+        }
+        if spec_norm is not None:
+            run_payload["spec_normalization"] = spec_norm.model_dump()
+        yield f"data: {_json.dumps(run_payload)}\n\n"
 
         yield f"data: {_json.dumps({'type': 'done'})}\n\n"
     except Exception as e:
@@ -606,8 +741,17 @@ def api_assistant_stream(request: Request, body: AssistantStreamRequest):
 def api_generate_strategy(request: Request, body: GenerateStrategyRequest):
     _check_anthropic_key()
     try:
-        spec = generate_strategy_spec(body.description)
-        return GenerateStrategyResponse(spec=spec)
+        spec, spec_norm = generate_strategy_spec(body.description)
+        cap = assess_strategy_spec(spec)
+        panel = _build_strategy_quality_panel(spec, spec_norm, cap)
+        publish_executable_intent(
+            user_prompt=body.description,
+            ai_reasoning=_reasoning_from_spec(spec, spec_norm),
+            strategy_spec=spec.model_dump(),
+            symbol=(spec.universe.symbols[0] if spec.universe.symbols else None),
+            model_id=settings.llm_model,
+        )
+        return GenerateStrategyResponse(spec=spec, spec_normalization=spec_norm, strategy_quality=panel)
     except HTTPException:
         raise
     except Exception as e:
@@ -631,7 +775,10 @@ def api_generate_program(body: GenerateProgramRequest):
         symbol=(body.strategy_spec.universe.symbols[0] if body.strategy_spec.universe.symbols else "AAPL"),
         timeframe=body.strategy_spec.universe.timeframe.value if hasattr(body.strategy_spec.universe.timeframe, "value") else str(body.strategy_spec.universe.timeframe),
     )
-    return GenerateProgramResponse(program=GeneratedProgram(code=code, language="python"))
+    return GenerateProgramResponse(
+        program=GeneratedProgram(code=code, language="python"),
+        validation=check_python_program_validation(code),
+    )
 
 
 @app.post("/generate-and-backtest", response_model=GenerateAndBacktestResponse)
@@ -669,6 +816,14 @@ def api_generate_and_backtest(request: Request, body: GenerateAndBacktestRequest
             period=backtest_period,
             timeframe=backtest_timeframe,
             program_code=code,
+        )
+        publish_executable_intent(
+            user_prompt=f"generate-and-backtest:{body.symbol or 'AAPL'}",
+            ai_reasoning=_json.dumps({"program_preview": code[:6000]}, default=str),
+            strategy_spec=body.strategy_spec.model_dump(),
+            symbol=body.symbol or "AAPL",
+            idempotency_key=str(uuid.uuid4()),
+            model_id=settings.llm_model,
         )
         return GenerateAndBacktestResponse(run_id=run_id, program_code=code)
     except HTTPException:
@@ -721,25 +876,18 @@ def run_program(body: RunProgramRequest):
         run.error = None
         session.add(run)
         session.commit()
-    try:
-        q = get_queue()
-        q.enqueue("lpft_worker.jobs.run_backtest_job", body.run_id, job_id=f"run_{body.run_id}")
-    except Exception:
-        with Session(engine) as session:
-            run = session.get(Run, body.run_id)
-            if not run:
-                raise HTTPException(status_code=404, detail="Run not found")
-            symbol = run.symbol or "AAPL"
-            period = run.period or "1y"
-            timeframe = run.timeframe or "1d"
-            code = run.program_code or ""
-        _inline_complete_run(
-            body.run_id,
-            symbol=symbol,
-            period=period,
-            timeframe=timeframe,
-            program_code=code,
-        )
+        rid = run.id
+        symbol = run.symbol or "AAPL"
+        period = run.period or "1y"
+        timeframe = run.timeframe or "1d"
+        code = run.program_code or ""
+    _enqueue_backtest_with_fallback(
+        rid,
+        symbol=symbol,
+        period=period,
+        timeframe=timeframe,
+        program_code=code,
+    )
     return RunProgramResponse(run_id=body.run_id, status=RunStatus.pending)
 
 

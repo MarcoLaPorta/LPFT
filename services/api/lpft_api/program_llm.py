@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import re
 import textwrap
 from anthropic import Anthropic
@@ -7,35 +8,90 @@ from anthropic import Anthropic
 from lpft_api.capabilities import assess_strategy_spec
 from lpft_api.config import settings
 from lpft_api.dsl import StrategyKind, StrategySpec
-from lpft_shared.engine import ProgramMetadata, embed_program_metadata
+from lpft_shared.engine import ProgramMetadata, ProgramSecurityError, embed_program_metadata, validate_python
+
+LPFT_META_PREFIX = "# LPFT-META:"
 
 _client: Anthropic | None = None
 
-_prompt = """You repair or improve custom Python code for the LPFT shared backtesting engine.
-The code must define either `generate_positions(ohlcv: pd.DataFrame)` or `generate_signals(ohlcv: pd.DataFrame)`.
-Supported outputs:
-- a target-position Series aligned to the OHLCV index
-- a dict with target_position, or entries/exits, or entries/exits plus short_entries/short_exits
-- a tuple like (entries, exits) or (entries, exits, short_entries, short_exits)
-Use only pandas and the OHLCV columns open, high, low, close, volume.
-- Prefer `generate_positions` that returns a float target-position Series.
-- Initialize numeric series with `0.0`, not `0`, to avoid pandas integer-casting failures.
-- Avoid lookahead bias.
-- Prefer vectorized pandas logic; use loops only when stateful trade management is truly necessary.
-- Keep the code readable, conservative, and production-quality for the information available.
-Output only Python code, no markdown or explanation."""
-_repair_prompt = """You repair Python trading strategy code for a backtesting engine.
-Return only corrected Python code.
+
+def _strip_lpft_meta_header(code: str) -> str:
+    lines = code.splitlines()
+    if lines and lines[0].startswith(LPFT_META_PREFIX):
+        return "\n".join(lines[1:])
+    return code
+
+
+def _python_syntax_error_message(code: str) -> str | None:
+    """None se `ast.parse` riesce sul corpo (senza riga META)."""
+    body = _strip_lpft_meta_header(code)
+    try:
+        ast.parse(body)
+    except SyntaxError as e:
+        ln = e.lineno or 0
+        return f"{e.msg} (line {ln})"
+    return None
+
+
+def _collect_python_static_issues(code: str) -> list[str]:
+    issues: list[str] = []
+    try:
+        validate_python(code)
+    except ProgramSecurityError as e:
+        issues.append(f"security: {e}")
+    syn = _python_syntax_error_message(code)
+    if syn:
+        issues.append(f"syntax: {syn}")
+    return issues
+
+PROGRAM_MAX_TOKENS = 8192
+
+_prompt = """You write custom Python for the LPFT shared backtesting engine.
+
+Output ONLY Python source (no markdown fences, no explanation after the code).
+
+The server will inject `# LPFT-META: {...}` from the StrategySpec JSON you receive — do NOT add LPFT-META yourself and do not hardcode symbols/timeframe that contradict the JSON.
+
+Required structure:
+- A module-level docstring summarizing the strategy in 2–4 sentences.
+- `def generate_positions(ohlcv: pd.DataFrame)` (preferred) OR `generate_signals` with the same signature rules as below.
+- Use only `pandas` and columns: open, high, low, close, volume on `ohlcv`.
+- Initialize every float Series with 0.0 (not integer 0) to avoid dtype traps.
+- Handle warm-up: do not emit trades until indicators have enough history; use `.shift(1)` or equivalent so decisions at bar t use data available at bar close (no lookahead).
+- Replace inf/NaN explicitly (e.g. after division or rolling std).
+- Prefer clear, vectorized logic; comment non-obvious thresholds and windows.
+
+Minimal pattern (adapt thresholds/windows to the spec; output real code without fences):
+  import pandas as pd
+  pandas = pd
+  def generate_positions(ohlcv: pd.DataFrame):
+      data = ohlcv.copy()
+      close = data["close"]
+      fast = close.rolling(20, min_periods=20).mean()
+      slow = close.rolling(50, min_periods=50).mean()
+      sig = (fast > slow).shift(1).fillna(False)
+      target = pd.Series(0.0, index=data.index)
+      target.loc[sig] = 1.0
+      return target
+
+Return shape (pick one):
+- `pd.Series` of target positions in [-1, 1] or [0, 1] aligned to `ohlcv.index`, OR
+- `dict` with `target_position` Series, OR legacy dict/tuple with entries/exits (booleans) if the spec truly needs event semantics.
+
+Length: aim for **robust production code**, not a minimal snippet — typically **60–180 lines** including comments unless the strategy is trivially simple. If the StrategySpec implies multi-step logic (filters, regimes, stops), implement it explicitly.
+
+Do not reference bid/ask, order book, or data not in OHLCV."""
+_repair_prompt = """You repair or complete Python trading strategy code for LPFT backtesting.
+Return only Python code (no markdown fences).
 
 Rules:
-- The code must work with `generate_positions(ohlcv: pd.DataFrame)` or `generate_signals(ohlcv: pd.DataFrame)`
-- Use only pandas and the OHLCV columns open, high, low, close, volume
-- Prefer returning a float target-position Series or a dict with entries/exits
-- Initialize numeric series with `0.0`, not `0`, unless the series is intentionally boolean
-- Avoid lookahead bias and brittle index tricks
-- Keep the code clear, robust, and directly tied to the provided strategy intent
-- Do not use unsupported concepts like bid/ask spread, order book, market making, or fake inventory logic
-- Do not output markdown or explanations
+- Must define `generate_positions(ohlcv: pd.DataFrame)` or `generate_signals` with the same constraints as production LPFT code.
+- Use only pandas and OHLCV columns: open, high, low, close, volume.
+- Do NOT add `# LPFT-META` (injected server-side from StrategySpec).
+- If the draft is a short stub, expand it into a full implementation: docstring, comments, NaN/inf handling, warm-up bars, vectorized logic where possible.
+- Initialize numeric series with 0.0; avoid lookahead; use shift(1) where decisions must use prior bar data.
+- Align fee/slippage/timing semantics with the StrategySpec contract block in the user message when relevant.
+- Do not output explanations outside the code.
 """
 
 
@@ -44,6 +100,39 @@ def _get_client() -> Anthropic:
     if _client is None:
         _client = Anthropic(api_key=settings.anthropic_api_key)
     return _client
+
+
+def _substantive_line_count(code: str) -> int:
+    """Righe non vuote e non solo commento (#)."""
+    n = 0
+    for line in code.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        n += 1
+    return n
+
+
+def _spec_contract_block(strategy_spec: StrategySpec) -> str:
+    """Human-readable contract so the code LLM aligns with risk/universe/execution from StrategySpec."""
+    hp = getattr(strategy_spec.data, "history_period", None)
+    hp_s = str(hp) if hp is not None else "(unset — engine may apply defaults)"
+    notes = (strategy_spec.data.notes or "").strip()
+    if len(notes) > 600:
+        notes = notes[:600] + "…"
+    return (
+        "\n\n--- LPFT ENGINE CONTRACT (must align; # LPFT-META is injected server-side — do NOT write it) ---\n"
+        f"symbols: {strategy_spec.universe.symbols}\n"
+        f"bar timeframe: {getattr(strategy_spec.universe.timeframe, 'value', strategy_spec.universe.timeframe)}\n"
+        f"history_period (backtest window): {hp_s}\n"
+        f"entry_timing: {strategy_spec.execution.entry_timing}\n"
+        f"position_mode: {strategy_spec.execution.position_mode}\n"
+        f"rebalance: {strategy_spec.execution.rebalance}\n"
+        f"fee_bps / slippage_bps: {strategy_spec.risk.fee_bps} / {strategy_spec.risk.slippage_bps}\n"
+        f"max_position_pct / max_gross_exposure: {strategy_spec.risk.max_position_pct} / {strategy_spec.risk.max_gross_exposure}\n"
+        f"data.notes (design intent): {notes or '(none)'}\n"
+        "Implement generate_positions consistent with these; respect warm-up and no lookahead.\n"
+    )
 
 
 def _metadata_for_spec(strategy_spec: StrategySpec, *, signal_semantics: str) -> ProgramMetadata:
@@ -73,6 +162,7 @@ def _metadata_for_spec(strategy_spec: StrategySpec, *, signal_semantics: str) ->
         coverage_requirement=str(strategy_spec.data.coverage_requirement),
         corporate_actions_required=bool(strategy_spec.data.corporate_actions_required),
         market=str(strategy_spec.data.market) if strategy_spec.data.market else None,
+        entry_timing=str(strategy_spec.execution.entry_timing),
     )
 
 
@@ -349,17 +439,55 @@ def _compile_builtin_program(strategy_spec: StrategySpec) -> str:
     raise ValueError(f"Unsupported deterministic compiler kind: {kind}")
 
 
+def _validate_or_repair_python(strategy_spec: StrategySpec, normalized_code: str) -> str:
+    """Security (`validate_python`) + sintassi (`ast.parse`); un repair LLM se necessario."""
+    issues = _collect_python_static_issues(normalized_code)
+    if not issues:
+        return normalized_code
+    repaired = repair_program(strategy_spec, normalized_code, "\n".join(issues))
+    issues2 = _collect_python_static_issues(repaired)
+    if issues2:
+        raise ValueError("Program validation failed after repair: " + "; ".join(issues2))
+    return repaired
+
+
+def check_python_program_validation(code: str) -> "PythonProgramValidation":
+    """Risultato controlli statici (utile per risposta API)."""
+    from lpft_api.schemas import PythonProgramValidation
+
+    syn = _python_syntax_error_message(code)
+    security_ok = True
+    try:
+        validate_python(code)
+    except ProgramSecurityError:
+        security_ok = False
+    return PythonProgramValidation(ast_ok=syn is None, security_ok=security_ok)
+
+
+def compile_preflight_dict(code: str) -> dict:
+    """Sintesi compile statica (ast + security) prima del run_generate_signals / backtest."""
+    pv = check_python_program_validation(code)
+    return {
+        "ast_ok": pv.ast_ok,
+        "security_ok": pv.security_ok,
+        "detail": None
+        if pv.ast_ok and pv.security_ok
+        else ("ast or security check failed — see repair path"),
+    }
+
+
 def generate_program(strategy_spec: StrategySpec) -> str:
     if str(strategy_spec.kind) == "StrategyKind.python" or getattr(strategy_spec.kind, "value", None) == "python":
         code = getattr(strategy_spec.params, "code", "")
         if isinstance(code, str) and code.strip():
             metadata = _metadata_for_spec(strategy_spec, signal_semantics=_infer_signal_semantics(code))
-            return _normalize_python_strategy_code(code, metadata)
-        user_prompt = "Strategy spec (JSON): " + strategy_spec.model_dump_json()
+            out = _normalize_python_strategy_code(code, metadata)
+            return _validate_or_repair_python(strategy_spec, out)
+        user_prompt = "Strategy spec (JSON): " + strategy_spec.model_dump_json() + _spec_contract_block(strategy_spec)
         client = _get_client()
         call = client.messages.create(
             model=settings.llm_model,
-            max_tokens=2048,
+            max_tokens=PROGRAM_MAX_TOKENS,
             system=_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
@@ -367,8 +495,33 @@ def generate_program(strategy_spec: StrategySpec) -> str:
         for block in call.content:
             if getattr(block, "text", None):
                 raw += block.text
+        raw = raw.strip()
+        # Seconda passata se la prima risposta è troppo corta (troppo spesso accade con kind "python").
+        if _substantive_line_count(raw) < 22:
+            expand = client.messages.create(
+                model=settings.llm_model,
+                max_tokens=PROGRAM_MAX_TOKENS,
+                system=_prompt,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": user_prompt
+                        + "\n\nThe previous draft was too short for production. Rewrite as a FULL implementation "
+                        "(typically 60+ substantive lines): docstring, comments, explicit NaN handling, warm-up period, "
+                        "vectorized pandas. Replace the previous draft entirely.\n\nPrevious draft:\n"
+                        + raw,
+                    }
+                ],
+            )
+            raw2 = ""
+            for block in expand.content:
+                if getattr(block, "text", None):
+                    raw2 += block.text
+            if raw2.strip():
+                raw = raw2.strip()
         metadata = _metadata_for_spec(strategy_spec, signal_semantics="target_position")
-        return _normalize_python_strategy_code(raw.strip(), metadata)
+        out = _normalize_python_strategy_code(raw, metadata)
+        return _validate_or_repair_python(strategy_spec, out)
     return _compile_builtin_program(strategy_spec)
 
 
@@ -379,6 +532,7 @@ def repair_program(strategy_spec: StrategySpec, broken_code: str, error_detail: 
     user_prompt = (
         "Strategy spec (JSON): "
         + strategy_spec.model_dump_json()
+        + _spec_contract_block(strategy_spec)
         + "\n\nBroken code:\n"
         + broken_code
         + "\n\nRuntime error:\n"
@@ -387,7 +541,7 @@ def repair_program(strategy_spec: StrategySpec, broken_code: str, error_detail: 
     )
     call = client.messages.create(
         model=settings.llm_model,
-        max_tokens=2048,
+        max_tokens=PROGRAM_MAX_TOKENS,
         system=_repair_prompt,
         messages=[{"role": "user", "content": user_prompt}],
     )

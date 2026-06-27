@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from sqlmodel import Session, select
@@ -9,15 +10,44 @@ from lpft_worker.db import Run, RunStatus, engine
 from lpft_shared.engine import extract_program_metadata, run_backtest_from_market_data, write_validation_artifact
 from lpft_shared.market_data import DataQualityError, load_market_data_bundle
 
+logger = logging.getLogger(__name__)
+
 
 def backtest_job(run_id: int, period: str | None = None) -> None:
     """Strategy-based backtest (delegate to program_backtest_job with program from DB)."""
     program_backtest_job(run_id, None, period)
 
 
-def paper_job(run_id: int) -> None:
-    """Paper trading job (stub)."""
-    pass
+def paper_job(run_id: int) -> dict[str, str | int]:
+    """Minimal paper-trading placeholder: marks run completed and logs the request."""
+    session = Session(engine)
+    try:
+        run = session.get(Run, run_id)
+        if not run:
+            logger.warning("paper_job skipped: run_id=%s not found", run_id)
+            return {"run_id": run_id, "status": "missing"}
+
+        logger.info(
+            "paper_job received run_id=%s symbol=%s timeframe=%s (simulation-only)",
+            run_id,
+            run.symbol,
+            run.timeframe,
+        )
+        run.status = RunStatus.completed
+        run.error = None
+        session.add(run)
+        session.commit()
+        return {"run_id": run_id, "status": "completed"}
+    except Exception:
+        run = session.get(Run, run_id)
+        if run:
+            run.status = RunStatus.failed
+            run.error = "paper execution simulation failed"
+            session.add(run)
+            session.commit()
+        raise
+    finally:
+        session.close()
 
 
 def run_backtest_job(run_id: int) -> None:

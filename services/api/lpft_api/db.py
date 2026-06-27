@@ -10,6 +10,21 @@ from sqlmodel import Field, SQLModel, create_engine
 from lpft_api.config import settings
 
 
+def _create_db_engine(url: str):
+    """Pool e ping solo per Postgres; SQLite legacy resta single-thread."""
+    if url.startswith("sqlite"):
+        return create_engine(
+            url,
+            echo=False,
+            connect_args={"check_same_thread": False},
+        )
+    return create_engine(
+        url,
+        echo=False,
+        pool_pre_ping=True,
+    )
+
+
 class RunType(str, Enum):
     backtest = "backtest"
     live = "live"
@@ -90,7 +105,7 @@ class PaperPosition(SQLModel, table=True):
 
 
 database_url = str(settings.database_url)
-engine = create_engine(database_url, echo=False)
+engine = _create_db_engine(database_url)
 
 
 def init_db() -> None:

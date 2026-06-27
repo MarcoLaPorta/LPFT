@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import {
   createChart,
+  createSeriesMarkers,
   IChartApi,
   ISeriesApi,
   LineData,
@@ -11,12 +12,21 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 
+export type EquityChartMarker = {
+  time: Time;
+  position: "aboveBar" | "belowBar";
+  color: string;
+  shape: "arrowUp" | "arrowDown" | "circle";
+  text?: string;
+};
+
 interface EquityChartProps {
   data: LineData[];
   height?: number;
   loading?: boolean;
   colorMode?: "positive" | "negative" | "neutral";
   visibleRange?: { from: number; to: number } | null;
+  markers?: EquityChartMarker[];
 }
 
 export function EquityChart({
@@ -25,34 +35,41 @@ export function EquityChart({
   loading,
   colorMode = "neutral",
   visibleRange = null,
+  markers = [],
 }: EquityChartProps) {
   const chartRef = useRef<HTMLDivElement>(null);
   const chartInstance = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Area"> | null>(null);
+  const markersPrimitiveRef = useRef<ReturnType<typeof createSeriesMarkers> | null>(null);
 
-  const palette =
-    colorMode === "positive"
-      ? {
-          lineColor: "rgba(21, 128, 61, 0.88)",
-          topColor: "rgba(21, 128, 61, 0.12)",
-          bottomColor: "rgba(0,0,0,0)",
-        }
-      : colorMode === "negative"
+  const palette = useMemo(
+    () =>
+      colorMode === "positive"
         ? {
-            lineColor: "rgba(185, 28, 28, 0.88)",
-            topColor: "rgba(185, 28, 28, 0.12)",
+            lineColor: "rgba(50, 215, 75, 0.9)",
+            topColor: "rgba(50, 215, 75, 0.14)",
             bottomColor: "rgba(0,0,0,0)",
           }
-        : {
-            lineColor: "rgba(229,231,235,0.78)",
-            topColor: "rgba(229,231,235,0.06)",
-            bottomColor: "rgba(0,0,0,0)",
-          };
+        : colorMode === "negative"
+          ? {
+              lineColor: "rgba(255, 69, 58, 0.88)",
+              topColor: "rgba(255, 69, 58, 0.12)",
+              bottomColor: "rgba(0,0,0,0)",
+            }
+          : {
+              /* Neutro: accento viola LPFT (allineato a globals --accent) */
+              lineColor: "rgba(124, 58, 237, 0.82)",
+              topColor: "rgba(124, 58, 237, 0.14)",
+              bottomColor: "rgba(0,0,0,0)",
+            },
+    [colorMode]
+  );
 
   useEffect(() => {
     if (!chartRef.current) return;
-    const chart = createChart(chartRef.current, {
-      width: chartRef.current.offsetWidth,
+    const el = chartRef.current;
+    const chart = createChart(el, {
+      width: Math.max(1, el.clientWidth || el.offsetWidth || 300),
       height,
       layout: { background: { color: "#07070a" }, textColor: "rgba(229,231,235,0.6)" },
       grid: { vertLines: { color: "rgba(255,255,255,0.04)" }, horzLines: { color: "rgba(255,255,255,0.04)" } },
@@ -65,30 +82,36 @@ export function EquityChart({
       bottomColor: palette.bottomColor,
       lineWidth: 1,
     });
-    area.setData(data);
-    if (visibleRange) {
-      chart.timeScale().setVisibleRange({
-        from: visibleRange.from as UTCTimestamp as Time,
-        to: visibleRange.to as UTCTimestamp as Time,
-      });
-    } else {
-      chart.timeScale().fitContent();
-    }
+    area.setData([]);
+    markersPrimitiveRef.current = createSeriesMarkers(area, []);
+    chart.timeScale().fitContent();
     chartInstance.current = chart;
     seriesRef.current = area;
-    const handleResize = () => chart.applyOptions({ width: chartRef.current?.offsetWidth ?? 0 });
+    const handleResize = () => {
+      if (!chartRef.current) return;
+      const w = Math.max(1, chartRef.current.clientWidth || chartRef.current.offsetWidth);
+      chart.applyOptions({ width: w });
+    };
     window.addEventListener("resize", handleResize);
+    const ro = new ResizeObserver(handleResize);
+    ro.observe(el);
+    requestAnimationFrame(handleResize);
     return () => {
+      ro.disconnect();
       window.removeEventListener("resize", handleResize);
+      markersPrimitiveRef.current = null;
       chart.remove();
       chartInstance.current = null;
       seriesRef.current = null;
     };
-  }, [height]);
+  }, [height, palette]);
 
   useEffect(() => {
     if (seriesRef.current) {
       seriesRef.current.setData(data);
+    }
+    if (markersPrimitiveRef.current) {
+      markersPrimitiveRef.current.setMarkers(markers);
     }
     if (chartInstance.current) {
       if (visibleRange) {
@@ -100,7 +123,7 @@ export function EquityChart({
         chartInstance.current.timeScale().fitContent();
       }
     }
-  }, [data, visibleRange]);
+  }, [data, markers, visibleRange]);
 
   useEffect(() => {
     if (seriesRef.current) {
@@ -122,29 +145,4 @@ export function EquityChart({
   return <div ref={chartRef} className="overflow-hidden" style={{ height }} />;
 }
 
-export function parseEquityCsv(csvText: string): LineData[] {
-  const lines = csvText.trim().split("\n");
-  if (lines.length < 2) return [];
-  const header = lines[0].split(",").map((s) => s.trim());
-  const timeIdx = header.findIndex((h) => h.toLowerCase() === "datetime" || h === "date" || h === "0");
-  const valueIdx = header.findIndex((h) => h === "0" || h.toLowerCase() === "equity" || h === "value");
-  const tIdx = timeIdx >= 0 ? timeIdx : 0;
-  const vIdx = valueIdx >= 0 ? valueIdx : header.length - 1;
-  const out: LineData[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const parts = lines[i].split(",").map((s) => s.trim());
-    const rawTime = parts[tIdx];
-    const value = parseFloat(parts[vIdx]);
-    if (Number.isNaN(value)) continue;
-    let timeSec: number;
-    if (/^\d{10,}$/.test(rawTime)) {
-      timeSec = parseInt(rawTime, 10);
-    } else {
-      const d = new Date(rawTime);
-      timeSec = Math.floor(d.getTime() / 1000);
-    }
-    if (!Number.isFinite(timeSec) || timeSec <= 0) continue;
-    out.push({ time: timeSec as UTCTimestamp as Time, value });
-  }
-  return out.sort((a, b) => Number(a.time) - Number(b.time));
-}
+export { parseEquityCsv } from "../../lib/equityCsv";

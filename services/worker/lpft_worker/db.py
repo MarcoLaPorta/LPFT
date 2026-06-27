@@ -10,6 +10,16 @@ from sqlmodel import Field, SQLModel, create_engine
 from lpft_worker.config import settings
 
 
+def _create_db_engine(url: str):
+    if url.startswith("sqlite"):
+        return create_engine(
+            url,
+            echo=False,
+            connect_args={"check_same_thread": False},
+        )
+    return create_engine(url, echo=False, pool_pre_ping=True)
+
+
 class RunStatus(str, Enum):
     pending = "pending"
     running = "running"
@@ -31,4 +41,4 @@ class Run(SQLModel, table=True):
     error: Optional[str] = None
 
 
-engine = create_engine(str(settings.database_url), echo=False)
+engine = _create_db_engine(str(settings.database_url))

@@ -6,16 +6,45 @@
   "scripts": {
     "dev": "WATCHPACK_POLLING=true next dev -H 0.0.0.0 -p 3000",
     "dev:clean": "rm -rf .next && WATCHPACK_POLLING=true next dev -H 0.0.0.0 -p 3000",
+    "dev:free-port": "lsof -ti :3000 | xargs kill -9 2>/dev/null || true",
+    "dev:restart": "npm run dev:free-port && rm -rf .next && WATCHPACK_POLLING=true next dev -H 0.0.0.0 -p 3000",
     "build:clean": "rm -rf .next && next build",
     "build": "next build",
     "start": "next start -p 3000",
-    "lint": "next lint"
+    "lint": "eslint .",
+    "clean": "rm -rf .next",
+    "sweep": "tsx scripts/sweep-execution-logs.ts",
+    "keeper": "tsx scripts/sweep-execution-logs.ts",
+    "keeper:loop": "SWEEP_INTERVAL_MS=5000 tsx scripts/sweep-execution-logs.ts",
+    "seed:web3": "tsx scripts/seed-web3-local.ts",
+    "seed:rwa": "tsx scripts/seed-rwa-tokens.ts",
+    "deploy:parse-forge": "tsx scripts/forge-deploy-to-env.ts",
+    "rlff:export": "tsx scripts/export-rlff-dataset.ts",
+    "worker:intents": "tsx scripts/intent-listener.ts",
+    "postinstall": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:deploy": "prisma migrate deploy",
+    "prisma:studio": "prisma studio",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
-    "lightweight-charts": "^5.1.0",
+    "@ai-sdk/anthropic": "^3.0.78",
+    "@ai-sdk/react": "^3.0.184",
+    "@prisma/client": "^6.19.0",
+    "@rainbow-me/rainbowkit": "^2.2.11",
+    "@tanstack/react-query": "^5.100.11",
+    "ai": "^6.0.182",
+    "lightweight-charts": "^5.2.0",
     "next": "^15.2.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "redis": "^4.7.0",
+    "viem": "^2.50.4",
+    "wagmi": "^2.19.5",
+    "yahoo-finance2": "^3.14.0",
+    "zod": "^4.4.3",
+    "zustand": "^5.0.13"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.1.0",
@@ -23,10 +52,14 @@
     "@types/react": "^19.0.1",
     "@types/react-dom": "^19.0.1",
     "autoprefixer": "^10.4.20",
+    "dotenv": "^16.4.5",
     "eslint": "^9.18.0",
     "eslint-config-next": "^15.2.0",
     "postcss": "^8.4.49",
+    "prisma": "^6.19.0",
     "tailwindcss": "^3.4.16",
-    "typescript": "^5.7.2"
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^3.2.4"
   }
 }

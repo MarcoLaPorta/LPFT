@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from enum import Enum
 from typing import Literal, Union
 
@@ -113,7 +114,7 @@ class DataRequirements(BaseModel):
     market_model: Literal["ohlcv", "bid_ask", "order_book", "options"] = "ohlcv"
     requires_intrabar: bool = False
     asset_class: Literal["auto", "equity", "etf", "crypto"] = "auto"
-    provider_preference: Literal["auto", "yahoo", "stooq", "alpaca"] = "auto"
+    provider_preference: Literal["auto", "yahoo", "stooq"] = "auto"
     quality_policy: Literal["strict_gate", "quality_labels", "best_effort"] = "best_effort"
     freshness_requirement: Literal["relaxed", "standard", "strict"] = "standard"
     coverage_requirement: Literal["relaxed", "standard", "strict"] = "standard"
@@ -238,6 +239,11 @@ class StrategySpec(BaseModel):
                     pass
             data = {**data, "params": normalized_params}
             params = data["params"]
+        if isinstance(data.get("data"), dict):
+            dd = dict(data["data"])
+            if str(dd.get("provider_preference", "") or "").strip().lower() == "alpaca":
+                dd["provider_preference"] = "auto"
+                data = {**data, "data": dd}
         if isinstance(params, dict) and kind is not None:
             kind_to_type = {
                 "sma_crossover": SmaCrossoverParams,
@@ -253,3 +259,32 @@ class StrategySpec(BaseModel):
             if t:
                 data = {**data, "params": t.model_validate(params)}
         return data
+
+
+def coerce_spec_to_python_llm_implementation(spec: StrategySpec) -> StrategySpec:
+    """
+    Usato quando l'utente ha compilato il form «parametri strategia»: il primo LLM può
+    restituire kind built-in (poche righe dal compilatore). Forziamo kind ``python`` con
+    ``params.code`` vuoto così ``generate_program`` invoca sempre l'LLM sullo spec.
+
+    L'intero spec precedente (inclusi numeri e kind) è allegato in ``data.notes`` in JSON
+    così il generatore di programma può tradurlo in ``generate_positions`` completo.
+    """
+    prior_json = json.dumps(spec.model_dump(mode="json"), ensure_ascii=False)
+    note_extra = (
+        "\n\n[LPFT_PARAM_FORM] Implementazione richiesta esclusivamente in Python "
+        "(def generate_positions). Non usare kind compilati. "
+        "Rispetta l’intero intento sotto (simboli, timeframe, risk, execution, data, parametri numerici):\n"
+        + prior_json[:16000]
+    )
+    new_notes = ((spec.data.notes or "") + note_extra).strip()
+    if len(new_notes) > 24000:
+        new_notes = new_notes[:24000] + "…"
+    return StrategySpec(
+        kind=StrategyKind.python,
+        params=PythonParams(code=""),
+        risk=spec.risk,
+        universe=spec.universe,
+        execution=spec.execution,
+        data=spec.data.model_copy(update={"notes": new_notes}),
+    )

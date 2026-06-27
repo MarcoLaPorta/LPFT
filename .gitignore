@@ -24,9 +24,31 @@ __pycache__/
 .venv/
 venv/
 
-# Environment / secrets
+# Environment / secrets — MAI committare
 .env
 .env.*
+!.env.example
+!**/.env.example
+
+# Chiavi / wallet (se esportate per errore)
+*.pem
+*.key
+id_rsa*
+**/secrets/
+
+# Foundry build & deploy local
+packages/contracts/cache/
+packages/contracts/out/
+packages/contracts/broadcast/
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Cursor / IDE local
+.cursor/
+
+# File personali non progetto
+es 3-4.pdf
 
 # IDE / editor
 .idea/
@@ -42,6 +64,7 @@ storage/datasets/
 storage/*.db
 storage/*.sqlite
 storage/*.sqlite3
+apps/web/data/*.jsonl
 
 # OS / temp
 *.log

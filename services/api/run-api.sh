@@ -11,7 +11,7 @@ else
   exit 1
 fi
 
-export LPFT_DATABASE_URL="${LPFT_DATABASE_URL:-sqlite:///./lpft.db}"
+export LPFT_DATABASE_URL="${LPFT_DATABASE_URL:-postgresql+psycopg://lpft:lpft@127.0.0.1:5432/lpft}"
 export LPFT_REDIS_URL="${LPFT_REDIS_URL:-redis://localhost:6379/0}"
 
 echo "API su http://localhost:8000 (docs: http://localhost:8000/docs)"

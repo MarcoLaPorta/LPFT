@@ -51,26 +51,17 @@ def assess_strategy_spec(spec: StrategySpec) -> CapabilityReport:
         suggestions.append("Use provider_preference=auto or yahoo for crypto.")
         status = CapabilityStatus.unsupported_with_conversion_path
 
-    if provider_plan == "alpaca" and asset_class == "crypto":
-        missing.append("Alpaca stock bars in this project are for US equities/ETFs only.")
-        suggestions.append("Use provider_preference=auto or yahoo for crypto.")
-        status = CapabilityStatus.unsupported_with_conversion_path
-
     if provider_plan == "stooq" and spec.universe.timeframe.value != "1d":
-        missing.append("Stooq fallback is only supported for daily OHLCV data.")
-        suggestions.append("Switch to daily bars or use provider_preference=auto/yahoo.")
-        status = CapabilityStatus.unsupported_with_conversion_path
+        warnings.append(
+            "Stooq provides daily OHLCV only in this project. For intraday backtests, use provider_preference=auto/yahoo."
+        )
+        suggestions.append("For intraday bars keep timeframe as requested and switch provider_preference to auto or yahoo.")
+        if status == CapabilityStatus.supported:
+            status = CapabilityStatus.supported_with_warnings
 
     if spec.data.history_period is None:
         warnings.append(
             "data.history_period is unset; the backtest will use the client request default. Prefer setting history_period explicitly for reproducibility and user-visible control."
-        )
-        if status == CapabilityStatus.supported:
-            status = CapabilityStatus.supported_with_warnings
-
-    if provider_plan == "alpaca" and asset_class in {"equity", "etf"}:
-        warnings.append(
-            "Alpaca bars follow the configured data feed (IEX on free tiers); OHLCV may differ from Yahoo consolidated free data."
         )
         if status == CapabilityStatus.supported:
             status = CapabilityStatus.supported_with_warnings

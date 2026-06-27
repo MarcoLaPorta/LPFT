@@ -46,7 +46,7 @@ Rules:
 - If mode is answer or analyze, strategy_prompt should be empty.
 - If mode is generate or modify, strategy_prompt must be a strong instruction that another model can turn into a valid structured trading strategy.
 - If mode is analyze, analysis_prompt must clearly state what to explain.
-- Set should_backtest to true only if the user clearly wants a generated/modified strategy tested and the request is specific enough to design responsibly.
+- should_backtest is legacy metadata for the planner only: after a successful generate/modify the server ALWAYS runs preflight data + backtest when the strategy is supported. You can leave it true.
 """
 
 _ANSWER_PROMPT = """You are LPFT Copilot, a high-quality trading assistant.
@@ -228,6 +228,8 @@ def _collect_requirement_snapshot(
     messages: list[AssistantMessage],
     *,
     current_spec: StrategySpec | None,
+    client_symbol: str | None = None,
+    symbol_explicit: bool = False,
 ) -> RequirementSnapshot:
     text = _normalize_message_text(messages)
     snapshot = RequirementSnapshot(missing=[])
@@ -276,6 +278,14 @@ def _collect_requirement_snapshot(
             snapshot.instrument = "BTC-USD"
         elif re.search(r"\bethereum\b", lowered):
             snapshot.instrument = "ETH-USD"
+
+    if (
+        snapshot.instrument is None
+        and symbol_explicit
+        and client_symbol
+        and str(client_symbol).strip()
+    ):
+        snapshot.instrument = str(client_symbol).strip().lstrip("$").upper()
 
     if _UNIVERSE_HINT_RE.search(text):
         if re.search(r"\b(?:btc|bitcoin|eth|ethereum|crypto)\b", lowered):
@@ -441,6 +451,8 @@ def _requirements_clarification_plan(
     latest_user: str,
     current_code: str | None,
     current_spec: StrategySpec | None,
+    client_symbol: str | None = None,
+    symbol_explicit: bool = False,
 ) -> AssistantPlan | None:
     if mode not in {"generate", "modify"}:
         return None
@@ -451,7 +463,12 @@ def _requirements_clarification_plan(
         return None
 
     italian = _looks_italian(text)
-    snapshot = _collect_requirement_snapshot(messages, current_spec=current_spec)
+    snapshot = _collect_requirement_snapshot(
+        messages,
+        current_spec=current_spec,
+        client_symbol=client_symbol,
+        symbol_explicit=symbol_explicit,
+    )
     summary = snapshot.summary_lines(italian=italian)
     missing_labels = (
         {
@@ -724,6 +741,22 @@ def _run_summary_text(run_id: int | None) -> str:
     return "Latest run summary:\n" + json.dumps(payload, indent=2)
 
 
+def _context_line_for_symbol(
+    *,
+    symbol: str,
+    symbol_explicit: bool,
+    current_spec: StrategySpec | None,
+) -> str:
+    if current_spec is not None:
+        return f"Current symbol (from active strategy): {symbol}"
+    if symbol_explicit and symbol.strip():
+        return f"Current symbol (user-confirmed): {symbol.strip()}"
+    return (
+        "Current symbol: not set — the user must name a ticker or ETF in the chat "
+        "(or confirm one via the UI) before generating a new strategy."
+    )
+
+
 def _context_text(
     messages: list[AssistantMessage],
     *,
@@ -733,12 +766,13 @@ def _context_text(
     symbol: str,
     period: str,
     timeframe: str,
+    symbol_explicit: bool = False,
 ) -> str:
     parts = [
         "Conversation transcript:",
         _messages_to_text(messages) or "(empty)",
         "",
-        f"Current symbol: {symbol}",
+        _context_line_for_symbol(symbol=symbol, symbol_explicit=symbol_explicit, current_spec=current_spec),
         f"Current period: {period}",
         f"Current timeframe: {timeframe}",
     ]
@@ -764,6 +798,7 @@ def plan_assistant_turn(
     symbol: str,
     period: str,
     timeframe: str,
+    symbol_explicit: bool = False,
 ) -> AssistantPlan:
     context = _context_text(
         messages,
@@ -773,6 +808,7 @@ def plan_assistant_turn(
         symbol=symbol,
         period=period,
         timeframe=timeframe,
+        symbol_explicit=symbol_explicit,
     )
     client = _get_client()
     call = client.messages.create(
@@ -800,7 +836,10 @@ def plan_assistant_turn(
     plan = AssistantPlan(
         mode=mode,
         assistant_reply=str(data.get("assistant_reply") or "").strip() or "I’m on it.",
-        should_backtest=bool(data.get("should_backtest")) if mode in {"generate", "modify"} else False,
+        # Default True: la generazione strategia deve portare al backtest salvo esplicito false raro.
+        should_backtest=(
+            bool(data.get("should_backtest", True)) if mode in {"generate", "modify"} else False
+        ),
         strategy_prompt=str(data.get("strategy_prompt") or "").strip(),
         analysis_prompt=str(data.get("analysis_prompt") or "").strip(),
         clarification_question=str(data.get("clarification_question") or "").strip(),
@@ -816,6 +855,8 @@ def plan_assistant_turn(
         latest_user=_latest_user_message(messages),
         current_code=current_code,
         current_spec=current_spec,
+        client_symbol=symbol,
+        symbol_explicit=symbol_explicit,
     )
     return forced_clarification or plan
 
@@ -830,6 +871,7 @@ def stream_answer(
     period: str,
     timeframe: str,
     analysis_prompt: str = "",
+    symbol_explicit: bool = False,
 ) -> Iterable[str]:
     context = _context_text(
         messages,
@@ -839,6 +881,7 @@ def stream_answer(
         symbol=symbol,
         period=period,
         timeframe=timeframe,
+        symbol_explicit=symbol_explicit,
     )
     latest_user = _latest_user_message(messages)
     user_content = latest_user
@@ -868,14 +911,25 @@ def build_strategy_prompt(
     symbol: str,
     period: str,
     timeframe: str,
+    symbol_explicit: bool = False,
 ) -> str:
     latest_user = next((m.content for m in reversed(messages) if m.role == "user"), "")
-    snapshot = _collect_requirement_snapshot(messages, current_spec=current_spec)
+    snapshot = _collect_requirement_snapshot(
+        messages,
+        current_spec=current_spec,
+        client_symbol=symbol,
+        symbol_explicit=symbol_explicit,
+    )
+    target_symbol = (
+        symbol.strip()
+        if symbol_explicit and symbol.strip()
+        else (snapshot.instrument or "(derive from user messages and spec)")
+    )
     parts = [
         "User goal:",
         latest_user,
         "",
-        f"Target symbol: {symbol}",
+        f"Target symbol: {target_symbol}",
         f"Target period: {period}",
         f"Target timeframe: {timeframe}",
     ]
@@ -895,6 +949,12 @@ def build_strategy_prompt(
     parts.extend(
         [
             "",
+            "STRATEGY BRIEF (every item must appear in the emitted JSON, especially data.notes for any inference):",
+            "- universe.symbols (non-empty), universe.timeframe, data.history_period",
+            "- risk (max_position_pct, max_gross_exposure, fee_bps, slippage_bps, stops if any)",
+            "- execution (position_mode, rebalance, entry_timing)",
+            "- data.notes: short list of assumptions so the user can edit them",
+            "",
             "Return a valid trading strategy spec that best satisfies the request. Use practical defaults, realistic risk, and include universe.",
             "The model must emit a complete StrategySpec: every required param for the chosen kind, full risk and execution, universe.symbols and universe.timeframe, and data fields for OHLCV (including data.history_period 1m|3m|6m|1y|2y|5y). Nothing critical should be left implicit for the server to guess.",
             "Set universe.timeframe to the bar interval the strategy uses (1m|5m|15m|30m|1h|1d); it drives OHLCV bar size in the backtest.",
@@ -908,7 +968,7 @@ def build_strategy_prompt(
             "If you choose kind=python, prefer readable target-position logic, initialize numeric series with 0.0, avoid lookahead bias, and keep the implementation production-grade for the available information.",
             "Use execution.position_mode=long_short only when the user clearly wants short exposure.",
             "Set data.asset_class explicitly when the user is talking about equities, ETFs, or crypto.",
-            "Use data.provider_preference='auto' (Yahoo-first backtests) unless the user asks for a specific provider (yahoo, stooq, or alpaca with API keys configured).",
+            "Use data.provider_preference='auto' (Yahoo-first backtests) unless the user asks for a specific provider (yahoo or stooq).",
             "Default to data.quality_policy='best_effort' for free providers unless the user explicitly asks for stricter gating.",
             "For equities and ETFs, set data.corporate_actions_required=true unless the request clearly does not care about adjusted data.",
             "If one non-critical assumption still has to be inferred, choose the most conservative tradable assumption and record it in data.notes.",
