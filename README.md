@@ -213,4 +213,4 @@ Punto di partenza per esplorare il repository (codice attivo in `apps/web/`; `ag
 
 ## Licenza
 
-**MVP** — Prototipo dimostrativo di exchange quantitativo agentico (IA, backtest, DeFi non-custodial); codice pubblico a scopo espositivo, non destinato a uso commerciale senza verifica delle licenze delle dipendenze.
+**MVP** — Prototipo dimostrativo dell’Agentic DeFi Layer (IA, backtest, DeFi non-custodial); codice pubblico a scopo espositivo, non destinato a uso commerciale senza verifica delle licenze delle dipendenze.
